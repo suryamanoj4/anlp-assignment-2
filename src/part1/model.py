@@ -5,8 +5,9 @@ Shared by:
   - Part 2: dense MLP config (ffn_variant=1), different optimizer + dataset.
 
 Attention uses F.scaled_dot_product_attention (explicitly permitted by the
-assignment). Positional embeddings are learned; sequences must be left-packed
-(no padding) since attention is purely causal.
+assignment). Positional embeddings are learned. forward() accepts an optional
+attention_mask (B, T) with 1 = real token, 0 = pad, combined with the causal
+mask inside the attention layer; without one, attention is purely causal.
 """
 
 from __future__ import annotations
@@ -74,16 +75,20 @@ class MoE(nn.Module):
 
         self.register_buffer("usage_counts", torch.zeros(self.n_routed, dtype=torch.long))
         self.language_usage: dict[str, torch.Tensor] = {}
+        self.reset_usage()
 
     def reset_usage(self) -> None:
         self.usage_counts.zero_()
         self.language_usage = {}
+        self._prev_usage = self.usage_counts.clone()
 
     def record_usage(self, language: str) -> None:
-        """Called by the training loop with the batch's language; feeds the heatmap."""
-        # TODO(6): accumulate this batch's per-expert token counts into
-        #          self.language_usage[language] (a LongTensor over routed experts).
-        raise NotImplementedError
+        """Called by the train/eval loop once per batch; buckets routed counts per language."""
+        delta = self.usage_counts - self._prev_usage  # routed since the last call
+        self._prev_usage = self.usage_counts.clone()
+        if language not in self.language_usage:
+            self.language_usage[language] = torch.zeros_like(self.usage_counts)
+        self.language_usage[language] += delta
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Input: (B, T, d_model). Output: (B, T, d_model).
@@ -91,15 +96,30 @@ class MoE(nn.Module):
         flat = x.reshape(-1, D)
         # TODO(1): Router: gate logits (linear over flat), softmax, take top-k
         #          expert ids and their (re-normalized) weights for each token.
-        # TODO(2): Dispatch: group token indices by chosen expert id; run each
-        #          expert only on its own tokens; combine outputs as the
-        #          gate-weighted sum over the active experts per token.
-        # TODO(3): Variant 4: add the shared expert output (always active) to
-        #          the routed combination.
-        # TODO(4): Track usage: bump self.usage_counts per routed token so the
-        #          heatmap can be built after evaluation.
-        # TODO(5): Handle batches where some experts receive zero tokens.
-        raise NotImplementedError
+        scores = self.gate(flat)
+        gate_probs = torch.softmax(scores, dim=-1)
+        topk_w, topk_ids = torch.topk(gate_probs, k=self.n_active, dim=-1)
+        topk_w = topk_w / topk_w.sum(-1, keepdim=True)  # renormalize over selected
+
+        # TODO(2)+(5): Dispatch: run each expert only on the tokens that picked it,
+        #              weighted-combine into a zeroed buffer; skip empty experts.
+        out = torch.zeros_like(flat)
+        for e in range(self.n_routed):
+            coords = (topk_ids == e).nonzero()  # (num_slots, 2): [token_idx, slot_idx]
+            if coords.numel() == 0:  # no token routed to this expert
+                continue
+            tokens = coords[:, 0]
+            w = topk_w[tokens, coords[:, 1]]  # weight of expert e per token
+            out[tokens] += w[:, None] * self.experts[e](flat[tokens])
+
+        # Variant 4: shared expert is always active; no routing, no gate weights.
+        if self.n_shared > 0:
+            out += self.shared[0](flat)
+
+        # Usage tracking: one count per activation slot (top-2 tokens count twice).
+        self.usage_counts += torch.bincount(topk_ids.flatten(), minlength=self.n_routed)
+
+        return out.view(B, T, D)
 
 
 class CausalSelfAttention(nn.Module):
@@ -112,13 +132,23 @@ class CausalSelfAttention(nn.Module):
         self.proj = nn.Linear(config.d_model, config.d_model, bias=False)
         self.drop = nn.Dropout(config.dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # attn_mask: (B, T), 1 = real token, 0 = pad; combined with the causal mask.
         B, T, C = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        if attn_mask is None:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            # One bool mask over (B, 1, T, T): False = do not attend.
+            causal = torch.triu(
+                torch.ones(T, T, dtype=torch.bool, device=x.device), diagonal=1
+            )
+            padded = (attn_mask == 0).unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
+            mask = ~(causal | padded)  # broadcasts to (B, 1, T, T); True = attend
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.drop(self.proj(y))
 
@@ -131,8 +161,8 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(config.d_model)
         self.ffn = MoE(config) if config.ffn_variant > 1 else MLP(config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x))
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = x + self.attn(self.ln1(x), attn_mask)
         x = x + self.ffn(self.ln2(x))
         return x
 
@@ -158,15 +188,28 @@ class Transformer(nn.Module):
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, std=0.02)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # Input: (B, T) token ids. Output: (B, T, n_vocab) logits.
         B, T = x.shape
         assert T <= self.config.n_ctx
+        if attn_mask is not None:
+            assert attn_mask.shape == x.shape
         pos = torch.arange(T, device=x.device)
         h = self.tok_emb(x) + self.pos_emb(pos)
         for block in self.blocks:
-            h = block(h)
+            h = block(h, attn_mask)
         return self.lm_head(self.ln_f(h))
+
+    def record_usage(self, language: str) -> None:
+        """Ask every MoE block to accumulate routing counts for `language`."""
+        for block in self.blocks:
+            if isinstance(block.ffn, MoE):
+                block.ffn.record_usage(language)
+
+    def reset_usage(self) -> None:
+        for block in self.blocks:
+            if isinstance(block.ffn, MoE):
+                block.ffn.reset_usage()
 
 
 def count_total_params(model: nn.Module) -> int:
@@ -174,35 +217,50 @@ def count_total_params(model: nn.Module) -> int:
 
 
 def count_active_params(model: nn.Module) -> int:
-    """Per-token active parameter count (the quantity variant 5 must match to variant 1).
+    """Per-token ACTIVE parameters (variant 5's matching quantity vs variant 1).
 
-    TODO(7): compute it analytically:
-      - embedding + attention params are identical across variants; decide whether
-        they are included in the "active" budget (they are active for every token,
-        so including them is defensible; what matters is consistency).
-      - per FFN layer, dense MLP: 2 * d_model * d_ff.
-      - per FFN layer, MoE: 2 * d_model * (n_active_experts + n_shared_experts) * expert_d_ff,
-        plus the (tiny) gate projection.
+    Counts FFN layers only: embeddings + attention are identical across variants,
+    so they cancel out of any variant-vs-variant comparison. Per layer:
+      - dense MLP: 2 * d_model * d_ff
+      - MoE: 2 * d_model * (n_active + n_shared) * expert_d_ff + gate params
     """
-    raise NotImplementedError
+    config = model.config
+    active = 0
+    for block in model.blocks:
+        if isinstance(block.ffn, MoE):
+            m = block.ffn
+            d_ff = m.experts[0].fc1.out_features  # uniform expert width
+            active += 2 * config.d_model * (m.n_active + m.n_shared) * d_ff
+            active += m.gate.weight.numel()
+        else:
+            active += 2 * config.d_model * config.d_ff
+    return active
 
 
 def ffn_variant_config(variant: int, d_ff: int, n_experts: int = 4) -> dict:
-    """Config knobs for a given FFN variant, with expert widths chosen by param matching.
+    """Config knobs for an FFN variant, expert widths chosen by param matching.
 
-    Target: variants 1-4 have equal TOTAL params; variant 5 has equal ACTIVE params
-    (matched to variant 1).
-
-    Math to verify (per FFN layer, ignoring LayerNorms):
-      - dense MLP params        ~ 2 * d_model * d_ff
-      - MoE total params        ~ 2 * d_model * n_experts * expert_d_ff
-      - MoE active params       ~ 2 * d_model * (n_active + n_shared) * expert_d_ff
-
-    TODO(8): fill in the expert_d_ff (and shared-expert width, variant 4) per variant:
-      - v2 (4 experts, top-1):  total = dense  ->  expert_d_ff = d_ff / 4
-      - v3 (4 experts, top-2):  total = dense  ->  same widths as v2
-      - v4 (1 shared + 3 routed, 2/4 active): pick widths so TOTAL still matches dense
-        (shared expert and routed experts need not have the same width)
-      - v5 (4 experts, top-2):  active = dense ->  expert_d_ff = d_ff / 2
+    Targets: variants 1-4 equal TOTAL FFN params; variant 5 equal ACTIVE FFN params
+    (matched to variant 1). Math per layer (ignoring LayerNorms):
+      - dense:        2 * d_model * d_ff
+      - MoE total:    2 * d_model * n_experts * expert_d_ff
+      - MoE active:   2 * d_model * (n_active + n_shared) * expert_d_ff
+    The gate adds d_model * n_routed per layer (~0.1% of FFN params) --
+    a report-level footnote, not worth compensating.
     """
-    raise NotImplementedError
+    cfg = {"ffn_variant": variant, "n_experts": n_experts}
+    if variant == 1:
+        pass  # dense MLP; no expert knobs needed
+    elif variant == 2:
+        cfg.update(n_active_experts=1, n_shared_experts=0, expert_d_ff=d_ff // n_experts)
+    elif variant == 3:
+        cfg.update(n_active_experts=2, n_shared_experts=0, expert_d_ff=d_ff // n_experts)
+    elif variant == 4:
+        # 1 shared + 3 routed, uniform widths: total = 4 * 2d * (d_ff/4) = dense
+        cfg.update(n_active_experts=1, n_shared_experts=1, expert_d_ff=d_ff // n_experts)
+    elif variant == 5:
+        # top-2 active = dense: expert_d_ff = d_ff / 2 (total becomes 2x dense)
+        cfg.update(n_active_experts=2, n_shared_experts=0, expert_d_ff=d_ff // 2)
+    else:
+        raise ValueError(f"unknown FFN variant: {variant}")
+    return cfg

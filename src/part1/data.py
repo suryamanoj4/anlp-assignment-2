@@ -6,6 +6,7 @@ Every sample carries its source language label so the training loop can feed the
 MoE per-expert usage heatmap.
 """
 
+import functools
 from dataclasses import dataclass
 
 import numpy as np
@@ -75,14 +76,26 @@ class TranslationDataset(Dataset):
         }
 
 
-def collate_batch(samples) -> Part1Batch:
-    """Pad a batch to the longest sequence and build the attention mask.
-
-    TODO(5): pad input_ids to max T in the batch with tokenizer.pad_token_id;
-             labels padded with -100; attention_mask = (input_ids != pad_id).
-             Keep language labels as a plain list of strings.
-    """
-    raise NotImplementedError
+def collate_batch(samples, pad_id: int) -> Part1Batch:
+    """Pad a batch to the longest sequence and build the attention mask."""
+    ids = torch.nn.utils.rnn.pad_sequence(
+        [torch.tensor(s["ids"], dtype=torch.long) for s in samples],
+        batch_first=True,
+        padding_value=pad_id,
+    )
+    labels = torch.nn.utils.rnn.pad_sequence(
+        [torch.tensor(s["labels"], dtype=torch.long) for s in samples],
+        batch_first=True,
+        padding_value=-100,
+    )
+    attention_mask = (ids != pad_id).long()
+    language = [s["language"] for s in samples]
+    return Part1Batch(
+        input_ids=ids,
+        labels=labels,
+        attention_mask=attention_mask,
+        language=language,
+    )
 
 
 def make_dataloader(
@@ -94,10 +107,15 @@ def make_dataloader(
     num_workers: int = 0,
     drop_last: bool = True,
 ) -> DataLoader:
-    # TODO(6): wire TranslationDataset + collate_batch together.
-    # Optional: length-bucketed samplers can cut padded-waste substantially;
-    # not required, just a compute tip.
-    raise NotImplementedError
+    dataset = TranslationDataset(hf_dataset, tokenizer, max_len)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        drop_last=drop_last,
+        collate_fn=functools.partial(collate_batch, pad_id=tokenizer.pad_token_id),
+    )
 
 
 def count_real_tokens(batch: Part1Batch) -> int:
