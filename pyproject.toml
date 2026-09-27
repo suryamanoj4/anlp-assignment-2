@@ -4,7 +4,11 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
     "datasets>=5.0.1",
+    "huggingface_hub>=0.37.0",
+    "matplotlib>=3.9.0",
     "pyyaml>=6.0.3",
+    "sacrebleu>=2.4.0",
+    "safetensors>=0.6.0",
     "tokenizers>=0.23.2",
     "torch>=2.9.0",
     "transformers>=4.57.0",

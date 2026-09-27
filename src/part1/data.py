@@ -106,6 +106,7 @@ def make_dataloader(
     shuffle: bool = True,
     num_workers: int = 0,
     drop_last: bool = True,
+    generator: torch.Generator | None = None,
 ) -> DataLoader:
     dataset = TranslationDataset(hf_dataset, tokenizer, max_len)
     return DataLoader(
@@ -114,6 +115,7 @@ def make_dataloader(
         shuffle=shuffle,
         num_workers=num_workers,
         drop_last=drop_last,
+        generator=generator,  # same generator across variants => same shuffle stream
         collate_fn=functools.partial(collate_batch, pad_id=tokenizer.pad_token_id),
     )
 
