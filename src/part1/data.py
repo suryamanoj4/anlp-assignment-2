@@ -107,9 +107,13 @@ def make_dataloader(
     num_workers: int = 0,
     drop_last: bool = True,
     generator: torch.Generator | None = None,
+    what: str = "dataset",
 ) -> DataLoader:
+    """Build a loader over the tokenized samples; `what` names the stage in logs."""
+    n_rows = len(hf_dataset)
+    print(f"[data] building {what}: tokenizing {n_rows:,} rows x2 langs (vi, ja) -> samples ...")
     dataset = TranslationDataset(hf_dataset, tokenizer, max_len)
-    return DataLoader(
+    loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
@@ -118,6 +122,11 @@ def make_dataloader(
         generator=generator,  # same generator across variants => same shuffle stream
         collate_fn=functools.partial(collate_batch, pad_id=tokenizer.pad_token_id),
     )
+    print(
+        f"[data] {what} ready: {len(dataset):,} samples -> {len(loader):,} batches "
+        f"of {batch_size} ({'shuffled' if shuffle else 'sequential'}, drop_last={drop_last})"
+    )
+    return loader
 
 
 def count_real_tokens(batch: Part1Batch) -> int:

@@ -46,14 +46,20 @@ def main() -> None:
         raise SystemExit("HF_TOKEN not set in .env (create a token on huggingface.co)")
 
     ckpt_path = Path(args.ckpt)
+    print(f"[upload] loading checkpoint {ckpt_path} ...")
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     config = ckpt["config"]
     if is_dataclass(config):
         config = asdict(config)
+    print(
+        f"[upload] ckpt: variant {config.get('ffn_variant', 'unknown')} | "
+        f"tokens_seen {ckpt.get('tokens_seen', '?')} | val_ppl {ckpt.get('val_ppl', float('nan')):.3f}"
+    )
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         # Standard HF file layout: weights + config + card.
+        print(f"[upload] writing model.safetensors, config.json, README.md ...")
         from safetensors.torch import save_file
 
         save_file(ckpt["model"], tmp_path / "model.safetensors")
@@ -67,9 +73,11 @@ def main() -> None:
         (tmp_path / "README.md").write_text(readme)
 
         api = HfApi(token=token)
+        print(f"[upload] creating/updating repo {args.repo_id} ...")
         api.create_repo(repo_id=args.repo_id, exist_ok=True)
+        print(f"[upload] uploading folder to {args.repo_id} ...")
         api.upload_folder(folder_path=str(tmp_path), repo_id=args.repo_id, token=token)
-        print(f"uploaded {ckpt_path} -> https://huggingface.co/{args.repo_id}")
+        print(f"[upload] done -> https://huggingface.co/{args.repo_id}")
 
 
 if __name__ == "__main__":

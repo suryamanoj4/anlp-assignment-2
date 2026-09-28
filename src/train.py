@@ -76,6 +76,7 @@ def save_checkpoint(model, cfg: TrainConfig, tokens_seen: int, step: int, ppl: f
         },
         path,
     )
+    print(f"[train] saved checkpoint {path.name} (tokens {tokens_seen:,} | val ppl {ppl:.3f})")
     return path
 
 
@@ -102,8 +103,9 @@ def max_tokens_per_step(train_loader) -> int:
 
 
 @torch.no_grad()
-def evaluate_ppl(model, val_loader, device: str = "cuda") -> float:
+def evaluate_ppl(model, val_loader, device: str = "cuda", what: str = "data") -> float:
     """Mean target-position perplexity over the validation set."""
+    print(f"[eval] computing ppl over {len(val_loader):,} batches ({what}) ...")
     model.eval()
     total_ce, total_tokens = 0.0, 0
     for batch in val_loader:
@@ -150,6 +152,12 @@ def train_model(
     next_val = cfg.val_every_tokens
     best_ppl = float("inf")
     use_amp = cfg.amp and device.startswith("cuda")
+
+    print(
+        f"[train] {cfg.run_name} | device={device} | amp={use_amp} | budget={cfg.max_tokens:,} tokens "
+        f"| ~{tokens_per_step} tokens/step | {total_steps} steps | lr={cfg.lr} | "
+        f"warmup ~{warmup_steps} steps, cos-decay to {cfg.lr_min_ratio}"
+    )
 
     while tokens_seen < cfg.max_tokens:
         for batch in train_loader:
@@ -214,4 +222,5 @@ def train_model(
     save_checkpoint(model, cfg, tokens_seen, step, best_ppl, "final")
     if run is not None:
         run.finish()
+    print(f"[train] done: {step} steps, {tokens_seen:,} tokens, best val ppl {best_ppl:.3f}")
     return step, tokens_seen

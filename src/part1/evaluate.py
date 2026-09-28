@@ -6,6 +6,7 @@ Usage: called by main.py after training (or via --eval-only with a saved ckpt).
 
 import functools
 import json
+import os
 from pathlib import Path
 
 import matplotlib
@@ -20,6 +21,7 @@ from torch.utils.data import DataLoader, Dataset
 from src.part1.data import TranslationDataset, collate_batch
 from src.part1.model import Transformer
 from src.train import evaluate_ppl
+from src.utils import load_dotenv
 
 
 def load_checkpoint_model(ckpt_path: str, device: str):
@@ -116,21 +118,47 @@ def run_eval(
     max_new: int = 128,
     n_bleu_rows: int = 300,
 ) -> dict:
-    """Evaluate one trained variant on the test split: ppl + BLEU + heatmap."""
+    """Evaluate one trained variant on the test split: ppl + BLEU + heatmap.
+
+    Files always land in `out_dir` (metrics.json, generations.txt, heatmap PNG).
+    If WANDB_API_KEY is available, a short eval run is opened in the same
+    project: scalars as charts, the heatmap as an inline image, and the three
+    files as an artifact -- all linked from the run URL.
+    """
+    load_dotenv()
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     model, ckpt = load_checkpoint_model(ckpt_path, device)
     model.eval()
+    print(f"[eval] checkpoint {ckpt_path} (variant {ckpt['config'].ffn_variant}, tokens_seen {ckpt['tokens_seen']:,})")
+
+    run = None
+    if os.environ.get("WANDB_API_KEY") or os.environ.get("WANDB_MODE") == "offline":
+        try:
+            import wandb
+
+            run = wandb.init(
+                project=os.environ.get("WANDB_PROJECT", "anlp-assignment2"),
+                name=f"{Path(ckpt_path).stem}-eval",
+                reinit=True,
+                settings=wandb.Settings(init_timeout=120),
+            )
+        except Exception as exc:  # noqa: BLE001 - eval must not die on logging issues
+            print(f"wandb init failed, continuing offline: {exc}")
+            run = None
 
     # 1) Test-set perplexity (full test split).
     test_loader = _make_loader(TranslationDataset(hf_test, tokenizer, max_len), tokenizer, batch_size)
-    test_ppl = float(evaluate_ppl(model, test_loader, device))
+    test_ppl = float(evaluate_ppl(model, test_loader, device, what="test split"))
     model.eval()
 
     # 2) BLEU: greedy translate the first `n_bleu_rows` rows (vi->en and ja->en).
     preds, refs = [], []
-    with open(out_dir / "generations.txt", "w", encoding="utf-8") as f:
-        for row in hf_test.select(range(min(n_bleu_rows, len(hf_test)))):
+    gen_path = out_dir / f"generations_{Path(ckpt_path).stem}.txt"
+    n_bleu_rows = min(n_bleu_rows, len(hf_test))
+    print(f"[eval] [2/3] BLEU: greedy-translating {n_bleu_rows} rows x2 langs (max_new={max_new}) -> {gen_path.name}")
+    with open(gen_path, "w", encoding="utf-8") as f:
+        for i, row in enumerate(hf_test.select(range(n_bleu_rows))):
             for lang in ("vi", "ja"):
                 src, ref = row[lang].strip(), row["en"].strip()
                 if not src or not ref:
@@ -139,7 +167,10 @@ def run_eval(
                 preds.append(pred)
                 refs.append(ref)
                 f.write(f"[{lang}] src: {src}\nref: {ref}\npred: {pred}\n\n")
+            if (i + 1) % 50 == 0:
+                print(f"[eval] [2/3] translated {i + 1}/{n_bleu_rows} rows")
     bleu = sacrebleu.corpus_bleu(preds, [refs]).score
+    print(f"[eval] [2/3] done: {len(preds):,} translations, corpus bleu {bleu:.2f}")
 
     # 3) Heatmap: one inference pass per language over the full test split.
     ds = TranslationDataset(hf_test, tokenizer, max_len)
@@ -148,9 +179,14 @@ def run_eval(
         ffn = block.ffn
         if hasattr(ffn, "language_usage"):
             usage[block_idx] = ffn.language_usage
+    print(f"[eval] [3/3] usage passes over the full test split (one pass per language)")
     for lang in ("vi", "ja"):
-        collect_usage(model, _make_loader(LanguageSubset(ds, lang), tokenizer, batch_size), lang, device)
-    plot_usage_heatmap(usage, ["vi", "ja"], out_dir / f"heatmap_{Path(ckpt_path).stem}.png")
+        loader = _make_loader(LanguageSubset(ds, lang), tokenizer, batch_size)
+        print(f"[eval] [3/3] pass '{lang}': {len(loader):,} batches")
+        collect_usage(model, loader, lang, device)
+    heatmap_path = out_dir / f"heatmap_{Path(ckpt_path).stem}.png"
+    plot_usage_heatmap(usage, ["vi", "ja"], heatmap_path)
+    print(f"[eval] [3/3] heatmap written to {heatmap_path.name}")
 
     metrics = {
         "variant": ckpt["config"].ffn_variant,
@@ -162,4 +198,17 @@ def run_eval(
     }
     (out_dir / f"metrics_{Path(ckpt_path).stem}.json").write_text(json.dumps(metrics, indent=2))
     print(json.dumps(metrics, indent=2))
+    print(f"[eval] files written to {out_dir}/ (metrics, generations, heatmap for stem '{Path(ckpt_path).stem}')")
+
+    if run is not None:
+        heatmap_path = out_dir / f"heatmap_{Path(ckpt_path).stem}.png"
+        run.log({**metrics, "eval/heatmap": wandb.Image(str(heatmap_path))})
+        artifact = wandb.Artifact(name=f"{Path(ckpt_path).stem}-eval", type="evaluation")
+        for f in (heatmap_path, gen_path, out_dir / f"metrics_{Path(ckpt_path).stem}.json"):
+            if f.exists():
+                artifact.add_file(str(f))
+        run.log_artifact(artifact)
+        run.finish()
+        print(f"[eval] wandb run {run.id} finished (see {run.url})")
+
     return metrics
