@@ -3,12 +3,18 @@
 Usage:
     uv run python main.py part1                          # run ALL 5 FFN variants back-to-back
     uv run python main.py part1 --variant 2 --batch-size 32 --max-tokens 30_000_000
+    uv run python main.py part1 --output runs/part1      # ALL outputs under runs/part1/{checkpoints,assets}
     uv run python main.py part1 --variant 5 --eval-only  # rerun eval from saved best ckpt
     uv run python main.py part2 ...   (optimizers, coming soon)
     uv run python main.py part3 ...   (decoding strategies, coming soon)
 
 Part 1: all variants share the same shuffle stream (fixed seed) and the same
 token budget, so differences are attributable to the FFN variant alone.
+
+Output layout (default root: outputs/):
+    outputs/checkpoints/       model checkpoints (part1-v{N}_{best,tok...,final}.pt)
+    outputs/assets/tokenizer.json   trained BPE tokenizer
+    outputs/assets/eval/       metrics json, generations txt, heatmap png
 """
 
 import argparse
@@ -26,8 +32,13 @@ from src.train import TrainConfig, train_model
 from src.utils import load_dotenv
 
 DATASET_ID = "belumind/en-vi-ja-curated-500k-triplets"
-TOKENIZER_PATH = "assets/tokenizer.json"
 VOCAB_SIZE = 32_000
+
+
+def _out_paths(output: str) -> tuple[Path, Path, Path]:
+    """Resolve the output root -> (tokenizer file, checkpoints dir, eval dir)."""
+    root = Path(output)
+    return root / "assets" / "tokenizer.json", root / "checkpoints", root / "assets" / "eval"
 
 
 def _load_dataset(dataset_id: str):
@@ -49,20 +60,22 @@ def _load_dataset(dataset_id: str):
 
 def run_part1(args: argparse.Namespace) -> None:
     load_dotenv()
+    tokenizer_path, _, _ = _out_paths(args.output)
+    print(f"[main] outputs root: {Path(args.output)}/ | tokenizer -> {tokenizer_path}")
     generator = torch.Generator().manual_seed(args.seed)  # same stream for every variant
 
     # 1) Tokenizer: train once (cached on disk afterwards).
     ds = None
-    if Path(TOKENIZER_PATH).exists():
-        tokenizer = load_tokenizer(TOKENIZER_PATH)
-        print(f"tokenizer loaded from {TOKENIZER_PATH}")
+    if tokenizer_path.exists():
+        tokenizer = load_tokenizer(tokenizer_path)
+        print(f"tokenizer loaded from {tokenizer_path}")
     else:
         ds = _load_dataset(DATASET_ID)
         print(f"[main] training BPE tokenizer (vocab {VOCAB_SIZE:,}) on the train split; takes a few minutes ...")
         tokenizer = train_tokenizer_from_dataset(
-            ds["train"], ["en", "vi", "ja"], VOCAB_SIZE, TOKENIZER_PATH
+            ds["train"], ["en", "vi", "ja"], VOCAB_SIZE, tokenizer_path
         )
-        print(f"tokenizer trained and saved to {TOKENIZER_PATH}")
+        print(f"tokenizer trained and saved to {tokenizer_path}")
 
     if ds is None:
         ds = _load_dataset(DATASET_ID)
@@ -87,9 +100,11 @@ def run_variant(variant: int, args: argparse.Namespace, tokenizer, ds, generator
     print(f"v{variant}: {sum(p.numel() for p in model.parameters()):,} total params")
 
     run_name = run_name_of(variant)
+    _, ckpt_dir, eval_dir = _out_paths(args.output)
     train_cfg = TrainConfig(
         max_tokens=args.max_tokens,
         run_name=run_name,
+        ckpt_dir=str(ckpt_dir),  # outputs/<root>/checkpoints
     )
 
     if not args.eval_only:
@@ -107,7 +122,7 @@ def run_variant(variant: int, args: argparse.Namespace, tokenizer, ds, generator
     ckpt_path = f"{train_cfg.ckpt_dir}/{run_name}_best.pt"
     if not Path(ckpt_path).exists():
         raise SystemExit(f"{ckpt_path} not found; run without --eval-only first")
-    run_eval(ckpt_path, ds["test"], tokenizer, device=args.device)
+    run_eval(ckpt_path, ds["test"], tokenizer, device=args.device, out_dir=str(eval_dir))
 
 
 def run_part2(args: argparse.Namespace) -> None:
@@ -129,6 +144,8 @@ def build_parser() -> argparse.ArgumentParser:
     p1.add_argument("--max-tokens", type=int, default=30_000_000)
     p1.add_argument("--max-len", type=int, default=512)
     p1.add_argument("--seed", type=int, default=42)
+    p1.add_argument("--output", default="outputs",
+                    help="root dir for ALL outputs (checkpoints/, assets/tokenizer.json, assets/eval/ live under it); default: outputs")
     p1.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p1.add_argument("--eval-only", action="store_true", help="skip training; eval best ckpt")
     p1.set_defaults(func=run_part1)

@@ -5,7 +5,7 @@ finalized. Reads HF_TOKEN from .env (via src.utils.load_dotenv).
 
 Usage:
     uv run python -m src.upload_to_hf \
-        --ckpt checkpoints/v2_best.pt \
+        --ckpt outputs/checkpoints/part1-v2_best.pt \
         --repo-id <your-username>/anlp2-part1-v2
 """
 
