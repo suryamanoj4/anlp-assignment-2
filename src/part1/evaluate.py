@@ -94,6 +94,9 @@ def collect_usage(model, loader, language: str, device: str):
 
 def plot_usage_heatmap(block_usage, languages, save_path: str) -> None:
     """block_usage: dict layer_idx -> dict language -> counts tensor; sum over layers."""
+    if not block_usage:
+        print("[eval] no usage data (dense variant?) -- nothing to plot")
+        return
     n_experts = next(iter(next(iter(block_usage.values())).values())).numel()
     arr = np.zeros((len(languages), n_experts))
     for layer, per_lang in block_usage.items():
@@ -147,7 +150,6 @@ def run_eval(
             run = wandb.init(
                 project=os.environ.get("WANDB_PROJECT", "anlp-assignment2"),
                 name=f"{Path(ckpt_path).stem}-eval",
-                reinit=True,
                 settings=wandb.Settings(init_timeout=120),
             )
         except Exception as exc:  # noqa: BLE001 - eval must not die on logging issues
@@ -180,20 +182,26 @@ def run_eval(
     print(f"[eval] [2/3] done: {len(preds):,} translations, corpus bleu {bleu:.2f}")
 
     # 3) Heatmap: one inference pass per language over the full test split.
+    #    MoE variants only: dense (variant 1) has no experts to route, so the
+    #    passes would measure nothing and the plotter would see an empty dict.
     ds = TranslationDataset(hf_test, tokenizer, max_len)
     usage = {}
     for block_idx, block in enumerate(model.blocks):
         ffn = block.ffn
         if hasattr(ffn, "language_usage"):
             usage[block_idx] = ffn.language_usage
-    print(f"[eval] [3/3] usage passes over the full test split (one pass per language)")
-    for lang in ("vi", "ja"):
-        loader = _make_loader(LanguageSubset(ds, lang), tokenizer, batch_size)
-        print(f"[eval] [3/3] pass '{lang}': {len(loader):,} batches")
-        collect_usage(model, loader, lang, device)
     heatmap_path = out_dir / f"heatmap_{Path(ckpt_path).stem}.png"
-    plot_usage_heatmap(usage, ["vi", "ja"], heatmap_path)
-    print(f"[eval] [3/3] heatmap written to {heatmap_path.name}")
+    if usage:
+        print(f"[eval] [3/3] usage passes over the full test split (one pass per language)")
+        for lang in ("vi", "ja"):
+            loader = _make_loader(LanguageSubset(ds, lang), tokenizer, batch_size)
+            print(f"[eval] [3/3] pass '{lang}': {len(loader):,} batches")
+            collect_usage(model, loader, lang, device)
+        plot_usage_heatmap(usage, ["vi", "ja"], heatmap_path)
+        print(f"[eval] [3/3] heatmap written to {heatmap_path.name}")
+    else:
+        print(f"[eval] [3/3] skipped: variant {ckpt['config'].ffn_variant} is dense "
+              f"(no experts) -- no heatmap")
 
     metrics = {
         "variant": ckpt["config"].ffn_variant,
@@ -208,8 +216,10 @@ def run_eval(
     print(f"[eval] files written to {out_dir}/ (metrics, generations, heatmap for stem '{Path(ckpt_path).stem}')")
 
     if run is not None:
-        heatmap_path = out_dir / f"heatmap_{Path(ckpt_path).stem}.png"
-        run.log({**metrics, "eval/heatmap": wandb.Image(str(heatmap_path))})
+        log_dict = dict(metrics)
+        if heatmap_path.exists():  # dense variants have no heatmap
+            log_dict["eval/heatmap"] = wandb.Image(str(heatmap_path))
+        run.log(log_dict)
         artifact = wandb.Artifact(name=f"{Path(ckpt_path).stem}-eval", type="evaluation")
         for f in (heatmap_path, gen_path, out_dir / f"metrics_{Path(ckpt_path).stem}.json"):
             if f.exists():
