@@ -9,6 +9,13 @@ import json
 import os
 from pathlib import Path
 
+# Colab exports MPLBACKEND=module://matplotlib_inline.backend_inline, which is
+# invalid here because matplotlib-inline is not installed in this venv -- and
+# matplotlib validates that var at IMPORT time (rcParams init), killing any
+# `import matplotlib` before our use("Agg") below can run. This script only
+# saves PNGs, so force the headless backend before the import, unconditionally.
+os.environ["MPLBACKEND"] = "Agg"
+
 import matplotlib
 
 matplotlib.use("Agg")
