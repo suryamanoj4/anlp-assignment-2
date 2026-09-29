@@ -182,21 +182,23 @@ def run_eval(
     print(f"[eval] [2/3] done: {len(preds):,} translations, corpus bleu {bleu:.2f}")
 
     # 3) Heatmap: one inference pass per language over the full test split.
-    #    MoE variants only: dense (variant 1) has no experts to route, so the
-    #    passes would measure nothing and the plotter would see an empty dict.
+    #    MoE variants only. NOTE: reset_usage() REBINDS language_usage to a fresh
+    #    dict per pass, so references taken before the passes go stale -- capture
+    #    each language's counts right after ITS pass, while the dict is live.
     ds = TranslationDataset(hf_test, tokenizer, max_len)
-    usage = {}
-    for block_idx, block in enumerate(model.blocks):
-        ffn = block.ffn
-        if hasattr(ffn, "language_usage"):
-            usage[block_idx] = ffn.language_usage
+    has_moe = any(hasattr(b.ffn, "language_usage") for b in model.blocks)
     heatmap_path = out_dir / f"heatmap_{Path(ckpt_path).stem}.png"
-    if usage:
+    usage: dict[int, dict[str, torch.Tensor]] = {}
+    if has_moe:
         print(f"[eval] [3/3] usage passes over the full test split (one pass per language)")
         for lang in ("vi", "ja"):
             loader = _make_loader(LanguageSubset(ds, lang), tokenizer, batch_size)
             print(f"[eval] [3/3] pass '{lang}': {len(loader):,} batches")
             collect_usage(model, loader, lang, device)
+            for block_idx, block in enumerate(model.blocks):
+                ffn = block.ffn
+                if hasattr(ffn, "language_usage") and lang in ffn.language_usage:
+                    usage.setdefault(block_idx, {})[lang] = ffn.language_usage[lang].clone()
         plot_usage_heatmap(usage, ["vi", "ja"], heatmap_path)
         print(f"[eval] [3/3] heatmap written to {heatmap_path.name}")
     else:
