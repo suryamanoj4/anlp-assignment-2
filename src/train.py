@@ -5,8 +5,12 @@ pre-shifted labels (labels[i] = token after position i), so the loop itself
 is task-agnostic: masking differences already live in the labels (-100).
 
 Seams for the parts:
-  - optimizer: build_optimizer() -> AdamW now; part 2 registers its custom
-    optimizers here.
+  - optimizer: build_optimizer() -> torch AdamW for part 1; part 2 passes its
+    own optimizer (src/part2/optimizers.make_optimizer) through the
+    `optimizer=` argument.
+  - schedule: the LR schedule is applied MANUALLY each step (no
+    torch.optim.lr_scheduler.*) so part 2 stays inside the "no torch.optim
+    modules" rule: per group, lr = initial_lr * lr_lambda(step).
   - on_batch hook: part 1 uses it to feed model.record_usage(language).
 Part 3 has no training loop (decoding on a pretrained checkpoint).
 """
@@ -141,9 +145,14 @@ def train_model(
     tokens_per_step = max_tokens_per_step(train_loader)
     total_steps = max(cfg.max_tokens // max(tokens_per_step, 1), 1)
     warmup_steps = max(cfg.warmup_tokens // max(tokens_per_step, 1), 1)
-    schedule = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda s: lr_lambda(s, warmup_steps, total_steps, cfg.lr_min_ratio)
-    )
+    # No LambdaLR: lr is assigned manually inside the loop, so part 2 never
+    # imports torch.optim.lr_scheduler (assignment: no torch.optim modules
+    # besides torch.optim.Optimizer). Replicates LambdaLR's exact semantics:
+    # stamp initial_lr per group (as LRScheduler.__init__ did), run the first
+    # optimizer step at the base lr, then after the k-th step set
+    # lr = initial_lr * lr_lambda(k) for every group.
+    for g in optimizer.param_groups:
+        g.setdefault("initial_lr", g["lr"])
     run = init_wandb(cfg)
     model.train()
 
@@ -184,10 +193,16 @@ def train_model(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             optimizer.step()
-            schedule.step()
             optimizer.zero_grad(set_to_none=True)
 
             step += 1
+            # Manual schedule (LambdaLR-equivalent): after the k-th step,
+            # lr <- initial_lr * lr_lambda(k) for every param group.
+            for g in optimizer.param_groups:
+                g["lr"] = g["initial_lr"] * lr_lambda(
+                    step, warmup_steps, total_steps, cfg.lr_min_ratio
+                )
+            lr = optimizer.param_groups[0]["lr"]
             tokens_seen += count_real_tokens(batch)
             if on_batch is not None:
                 on_batch(model, batch)
@@ -196,7 +211,7 @@ def train_model(
                 metrics = {
                     "train/loss": loss.item(),
                     "tokens": tokens_seen,
-                    "lr": schedule.get_last_lr()[0],
+                    "lr": lr,
                     "step": step,
                 }
                 if run is not None:
