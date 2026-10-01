@@ -33,32 +33,73 @@ import torch
 
 def _clamp_grad_norm(g: torch.Tensor, g_norm: float) -> torch.Tensor:
     """Paper Appendix A preamble: g_hat = g * max(1, g_norm / ||g||_2)."""
-    # TODO(0): per-tensor 2-norm clamp; g_norm <= 0 must be a no-op (return g).
-    raise NotImplementedError
+    if g_norm <= 0.0:
+        return g  # paper convention: g_norm=0 -> max(1, 0) = 1 -> no-op
+    nrm = g.norm()  # per-tensor 2-norm
+    if nrm.item() == 0.0:
+        return g  # zero gradient (dead unit); avoid 0 * inf -> nan
+    return g * max(1.0, g_norm / nrm.item())
 
 
-def _newton_schulz(u: torch.Tensor, steps: int = 5) -> torch.Tensor:
-    """Newton-Schulz iteration: orthogonalize u toward the nearest O with
-    ||O||_op = 1 (paper Section 2 formula, Algorithm 8 calls it with steps=5).
+def _newton_schulz(
+    u: torch.Tensor,
+    steps: int = 5,
+    coefficients: tuple[float, float, float] = (1.5, -0.5, 0.0),
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    """Newton-Schulz: orthogonalize u toward the nearest O with ||O||_op = 1.
+
+    Spec: paper Section 2's NS(M) = M(aM + bM^T M + c(M^T M)^2) family and
+    Algorithm 8 (calls it with steps=5). Normalizing first by ||u||_F + eps
+    (this is where eps_muon lives) guarantees ||u||_op <= 1, the convergence
+    condition for the polynomial map on the singular values
+        sigma -> sigma * (a + b*sigma^2 + c*sigma^4).
+    With (a,b,c) = (3/2, -1/2, 0) every sigma -> 1 (0 is the other fixed
+    point), i.e. the polar factor: argmax_{||O||_op<=1} Tr(O^T u).
+    The alternative (3.4445, -4.775, 2.0315) Moon set converges to a scaled
+    orthogonal frame; coefficients are exposed so calibration can choose.
+    steps=0 returns the mere normalization (used by tests to isolate the
+    surrounding Muon mechanics).
+
+    Cost note (report material): the Gram matrix is formed on the MINOR
+    dimension — u(u^T u) == (u u^T)u by associativity, so form u^T u
+    (cols x cols) when rows >= cols and u u^T (rows x rows) otherwise,
+    multiplying on the left. That keeps the per-step NS cost a few percent of
+    the forward+backward for these d_model sizes (the paper's "under 10% with
+    proper implementation" point).
     """
-    # TODO(1): normalize u by its Frobenius norm, then iterate
-    #          u <- u @ (a*I + b*(u^T u) + c*(u^T u)^2)  (a,b,c configurable),
-    #          matching the coefficient family used in the paper (a=3/2,b=-1/2
-    #          classic, or the Moon set (3.4445, -4.775, 2.0315) that
-    #          torch.optim.Muon defaults to). Consider what epsilon does in
-    #          this loop (paper's eps_muon) and how many steps are enough.
-    raise NotImplementedError
+    a, b, c = coefficients
+    rows, cols = u.shape
+    u = u / (u.norm() + eps)
+    for _ in range(steps):
+        if rows >= cols:
+            gram = u.T @ u  # (cols, cols): u(u^T u) == u @ polynomial
+            eye = torch.eye(cols, device=u.device, dtype=u.dtype)
+            u = u @ (a * eye + b * gram + c * (gram @ gram))
+        else:
+            gram = u @ u.T  # (rows, rows): polynomial (u u^T) == left factor
+            eye = torch.eye(rows, device=u.device, dtype=u.dtype)
+            u = (a * eye + b * gram + c * (gram @ gram)) @ u
+    return u
 
 
 class AdamW(torch.optim.Optimizer):
-    """Category 1: AdamW with decoupled weight decay (Appendix A, Algorithm 1).
+    """Category 1: AdamW with decoupled weight decay — Appendix A, Algorithm 1.
 
-    Update rule to implement in step():
-        g_hat  = clamp(grad, g_norm)             (disabled at g_norm=0)
+    Part 2 drop-in replacement following the paper EXACTLY (both moments
+    bias-corrected):
+        g_hat  = clamp(grad, g_norm)                 (no-op at g_norm=0)
         m      = b1*m + (1-b1)*g_hat
         v      = b2*v + (1-b2)*g_hat^2
         m_hat  = m / (1 - b1^t),  v_hat = v / (1 - b2^t)
         p      = p - lr*m_hat/(sqrt(v_hat)+eps) - lr*wd*p      (decoupled)
+
+    NOTE: part 1 keeps torch.optim.AdamW (src/train.build_optimizer) untouched;
+    this class is the part 2 equivalent. torch 2.14's AdamW bias-corrects BOTH
+    moments (denominator sqrt(v)/sqrt(1-b2^t) + eps) — i.e. torch already
+    implements the paper's Algorithm 1 form, and our class reproduces it to
+    fp32 op-order noise (measured < 1e-7 rel in scripts/smoke_part2.py). The
+    older torch 1.x convention (uncorrected denominator) is NOT what 2.14 does.
     """
 
     def __init__(
@@ -68,94 +109,257 @@ class AdamW(torch.optim.Optimizer):
         betas: tuple[float, float] = (0.9, 0.98),
         eps: float = 1e-8,         # paper uses 1e-10 at scale
         weight_decay: float = 0.01,
-        g_norm: float = 0.0,       # 0 = off (must match torch.optim.AdamW exactly then)
+        g_norm: float = 0.0,       # 0 = off (paper convention: max(1, 0) = 1)
     ):
-        # TODO(2): defaults dict (torch.optim.Optimizer contract!), super().__init__,
-        #          sanity checks (betas in [0,1), lr >= 0 ...).
-        raise NotImplementedError
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= eps:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        b1, b2 = betas
+        if not 0.0 <= b1 < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 0: {b1}")
+        if not 0.0 <= b2 < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 1: {b2}")
+        if not 0.0 <= g_norm:
+            raise ValueError(f"Invalid g_norm value: {g_norm} (0 disables the clamp)")
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, g_norm=g_norm)
+        super().__init__(params, defaults)
 
     @torch.no_grad()
     def step(self, closure=None):
-        # TODO(3): loss = closure() if closure is not None
-        # TODO(4): per param_group, per param with grad:
-        #          state keys "step" (scalar long tensor, 1-based), "exp_avg", "exp_avg_sq"
-        #          (lazy init zeros_like on first touch; do NOT detach on update —
-        #          in-place ops on state are fine).
-        # TODO(5): m/v EMA + bias correction; wd applied DECOUPLED (on p, not
-        #          inside the sqrt denominator). Verify <your AdamW> ==
-        #          torch.optim.AdamW on identical inputs when g_norm=0.
-        raise NotImplementedError
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr, wd = group["lr"], group["weight_decay"]
+            b1, b2 = group["betas"]
+            eps, g_norm = group["eps"], group["g_norm"]
+            for p in group["params"]:
+                grad = p.grad
+                if grad is None:
+                    continue  # frozen param: nothing to update this step
+                state = self.state[p]
+                if len(state) == 0:
+                    # Lazy per-param initialization on first touch.
+                    state["step"] = torch.zeros((), dtype=torch.long, device=p.device)
+                    state["exp_avg"] = torch.zeros_like(p)     # m
+                    state["exp_avg_sq"] = torch.zeros_like(p)  # v
+                m, v = state["exp_avg"], state["exp_avg_sq"]
+                t = int(state["step"].item()) + 1  # 1-based step counter
+                state["step"].fill_(t)
+
+                # Paper Appendix A preamble: gradient norm clamp.
+                g_hat = _clamp_grad_norm(grad, g_norm)
+
+                # Decoupled weight decay: applied to p directly; never enters
+                # m/v nor the denominator (that is what 'decoupled' means here).
+                if wd != 0.0:
+                    p.mul_(1.0 - lr * wd)
+
+                # First/second moment EMAs of the clamped gradient. lerp_ is the fused
+                # form of the paper's EMA (m + (g-m)*t); as a side effect it is
+                # bit-identical to torch 2.14's adam, confirming empirically
+                # that torch implements the same convention (smoke_part2 B).
+                m.lerp_(g_hat, 1.0 - b1)
+                v.mul_(b2).addcmul_(g_hat, g_hat, value=1.0 - b2)
+
+                # Bias correction (paper Algorithm 1: BOTH moments).
+                m_hat = m / (1.0 - b1 ** t)
+                v_hat = v / (1.0 - b2 ** t)
+                denom = v_hat.sqrt().add_(eps)
+                p.addcdiv_(m_hat, denom, value=-lr)
+        return loss
 
 
 class NadamW(torch.optim.Optimizer):
     """Category 2: Nesterov (variance-reduced) AdamW — Appendix A, Algorithm 2.
 
-    Identical to AdamW except the numerator uses the lookahead
-        m_tilde = b1*m_t + (1-b1)*g_hat          (note: uses the UPDATED m_t)
-        then bias-corrects m_tilde and v as usual and divides.
-    No extra state beyond AdamW's (m, v, step). The update reduces gradient
-    variance in the sense that the Nesterov term anticipates the momentum
-    direction one step ahead (paper Section 2 shows the delta in red).
+    Spec: the assignment paper (Appendix A, Algorithm 2). Identical machinery
+    to our AdamW (Algorithm 1) with ONE delta: the numerator is the Nesterov
+    lookahead built from the UPDATED momentum,
+        m_tilde = b1*m_t + (1-b1)*g_hat
+    then both m_tilde and v are bias-corrected and divided as usual:
+        w <- w - lr * m_tilde_hat / (sqrt(v_hat) + eps) - lr * wd * w.
+    No extra state beyond AdamW's (m, v, step). The lookahead anticipates the
+    direction the momentum is already carrying, reducing per-step gradient
+    noise (paper Section 2 shows the delta in red).
+
+    NOTE for the report: torch.optim.NAdam is a DIFFERENT variant (Dozat's
+    momentum-decay schedule mu = b1*(1 - 0.5*0.96^(t*momentum_decay)); its
+    nesterov flag was removed in torch 2.14). We implement the paper's form.
     """
 
     def __init__(self, params, lr: float = 8e-4,
                  betas: tuple[float, float] = (0.9, 0.98),
                  eps: float = 1e-8, weight_decay: float = 0.01,
                  g_norm: float = 0.0):
-        # TODO(6): same init contract as AdamW; paper's tuned betas at scale
-        #          are often (0.95-0.98, 0.98) — calibration decides.
-        raise NotImplementedError
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= eps:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        b1, b2 = betas
+        if not 0.0 <= b1 < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 0: {b1}")
+        if not 0.0 <= b2 < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 1: {b2}")
+        if not 0.0 <= g_norm:
+            raise ValueError(f"Invalid g_norm value: {g_norm} (0 disables the clamp)")
+        # paper's tuned betas at scale are often (0.95-0.98, 0.98); calibration
+        # decides; these defaults keep the part-2 fairness constants.
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, g_norm=g_norm)
+        super().__init__(params, defaults)
 
     @torch.no_grad()
     def step(self, closure=None):
-        # TODO(7): reuse AdamW's m/v machinery, but per step:
-        #          1) update m from g_hat
-        #          2) build m_tilde = b1*m + (1-b1)*g_hat
-        #          3) bias-correct BOTH m_tilde and v with their 1-beta^t factors
-        #          4) p -= lr*m_tilde_hat/(sqrt(v_hat)+eps) - lr*wd*p
-        #          Think about whether your sqrt uses v_hat or raw v (the
-        #          paper's Algorithm 2 bias-corrects v; Section 2's gallery
-        #          short-hand does not — Appendix A is canonical).
-        raise NotImplementedError
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr, wd = group["lr"], group["weight_decay"]
+            b1, b2 = group["betas"]
+            eps, g_norm = group["eps"], group["g_norm"]
+            for p in group["params"]:
+                grad = p.grad
+                if grad is None:
+                    continue
+                state = self.state[p]
+                if len(state) == 0:
+                    # Same lazy layout as AdamW: m = exp_avg, v = exp_avg_sq.
+                    state["step"] = torch.zeros((), dtype=torch.long, device=p.device)
+                    state["exp_avg"] = torch.zeros_like(p)
+                    state["exp_avg_sq"] = torch.zeros_like(p)
+                m, v = state["exp_avg"], state["exp_avg_sq"]
+                t = int(state["step"].item()) + 1
+                state["step"].fill_(t)
+
+                # Paper preamble: gradient norm clamp.
+                g_hat = _clamp_grad_norm(grad, g_norm)
+
+                # Decoupled weight decay (same as Algorithm 1).
+                if wd != 0.0:
+                    p.mul_(1.0 - lr * wd)
+
+                # Moment EMAs — identical to Algorithm 1.
+                m.lerp_(g_hat, 1.0 - b1)
+                v.mul_(b2).addcmul_(g_hat, g_hat, value=1.0 - b2)
+
+                # THE delta (Algorithm 2): lookahead re-mix of the UPDATED m.
+                # Must be non-mutating: m feeds next step's EMA.
+                m_tilde = b1 * m + (1.0 - b1) * g_hat
+
+                # Bias correction of BOTH the lookahead numerator and v
+                # (Appendix A; Section 2's shorthand omits it — appendix wins).
+                m_hat = m_tilde / (1.0 - b1 ** t)
+                v_hat = v / (1.0 - b2 ** t)
+                denom = v_hat.sqrt().add_(eps)
+                p.addcdiv_(m_hat, denom, value=-lr)
+        return loss
 
 
 class Lion(torch.optim.Optimizer):
     """Category 3: memory-efficient Lion — Appendix A, Algorithm 3.
 
-    Single momentum state (no v): sign-based update.
-        m_hat   = b1*m_{t-1} + (1-b1)*g_hat      (input to the sign; b1 mixes)
+    Spec: the assignment paper (Appendix A, Algorithm 3). Single momentum
+    state (NO v buffer) + sign-projected update:
+        m_hat   = b1*m_{t-1} + (1-b1)*g_hat      (sign input; OLD state)
         m_next  = b2*m_{t-1} + (1-b2)*g_hat      (state advances with b2)
-        p       = p - lr*sign(m_hat) - lr*wd*p   (decoupled wd, same form as AdamW)
-    Note the two betas play different roles — read the appendix ordering
-    carefully before coding. Lion is scale-sensitive: expect lr ~1e-4..3e-4
-    vs AdamW's 8e-4; paper found its optimal wd ~0.6 at scale with their lambda
-    convention (calibration will settle ours).
+        p       = p - lr*sign(m_hat) - lr*wd*p   (decoupled wd, as in Alg 1)
+    Both lines read the PRE-update state — the paper's ordering is the spec.
+    sign(0)=0: those coordinates get decay only, which is intended.
+    Memory: one buffer per param (vs two for Adam-class) — the category claim.
+    No eps: sign() is discontinuous and needs no stability constant.
+    Scale-sensitive: lr ~1e-4..3e-4 (vs AdamW 8e-4); paper found optimal
+    wd ~0.6 at scale with their lambda convention — calibration decides.
     """
 
     def __init__(self, params, lr: float = 3e-4,
                  betas: tuple[float, float] = (0.9, 0.98),
                  weight_decay: float = 0.1,
                  g_norm: float = 0.0):
-        # TODO(8): init contract + defaults; no eps needed (sign is discontinuous).
-        raise NotImplementedError
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        b1, b2 = betas
+        if not 0.0 <= b1 < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 0: {b1}")
+        if not 0.0 <= b2 < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 1: {b2}")
+        if not 0.0 <= g_norm:
+            raise ValueError(f"Invalid g_norm value: {g_norm} (0 disables the clamp)")
+        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay, g_norm=g_norm)
+        super().__init__(params, defaults)
 
     @torch.no_grad()
     def step(self, closure=None):
-        # TODO(9): state key "exp_avg" (momentum) + "step".
-        #          Order matters: sign from the b1-mix of the PRE-update state,
-        #          then advance state with b2. sign(0)=0 -> those entries get
-        #          no gradient-driven move (only wd) — that is intended.
-        raise NotImplementedError
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr, wd = group["lr"], group["weight_decay"]
+            b1, b2 = group["betas"]
+            g_norm = group["g_norm"]
+            for p in group["params"]:
+                grad = p.grad
+                if grad is None:
+                    continue
+                state = self.state[p]
+                if len(state) == 0:
+                    # The category's memory claim: exp_avg is the ONLY buffer.
+                    # "step" kept for uniform state layout across optimizers;
+                    # Lion has no bias correction, so t never enters the math.
+                    state["step"] = torch.zeros((), dtype=torch.long, device=p.device)
+                    state["exp_avg"] = torch.zeros_like(p)
+                m = state["exp_avg"]
+                t = int(state["step"].item()) + 1
+                state["step"].fill_(t)
+
+                # Paper preamble: gradient norm clamp.
+                g_hat = _clamp_grad_norm(grad, g_norm)
+
+                # Sign input from the PRE-update state (Alg 3 ordering).
+                m_hat = b1 * m + (1.0 - b1) * g_hat
+
+                # Decoupled weight decay, then the sign-projected step.
+                if wd != 0.0:
+                    p.mul_(1.0 - lr * wd)
+                p.add_(torch.sign(m_hat), alpha=-lr)
+
+                # State advances with the OTHER beta — also from the old state.
+                # In-place is fine and intended: m_hat already consumed old m.
+                m.lerp_(g_hat, 1.0 - b2)
+        return loss
 
 
 class Muon(torch.optim.Optimizer):
     """Category 4: matrix-based Muon — Appendix A, Algorithm 8.
 
-    Split by parameter role, NOT by shape alone:
-      - LM head / embeddings / LayerNorm params: AdamW update with lr_adam.
-      - transformer-layer matrices: momentum m = b*m_prev + g_hat  (no 1-b!),
-        Nesterov combo u = b*m + g_hat, NewtonSchulz(u, steps=5), aspect
-        scale s = sqrt(max(1, rows/cols)), then p -= lr*u*s - lr*wd*p.
+    Spec: the assignment paper (Appendix A, Algorithm 8). Split by parameter
+    ROLE, not shape alone: LM head / embeddings / LayerNorm params get the
+    AdamW update (with lr_adam); transformer-layer matrices get:
+        m     = beta*m_prev + g_hat        (NO 1-beta factor — paper line)
+        u     = beta*m + g_hat             (Nesterov combo)
+        u     = NewtonSchulz(u, steps=5)
+        s     = sqrt(max(1, rows/cols))    (aspect-ratio gain)
+        p     = p - lr*u*s - lr*wd*p       (decoupled wd, as in Alg 1)
+    Partitioning: constructor takes a plain iterable of params plus an
+    OPTIONAL adam_ids set (param ids that belong to the AdamW branch even
+    when 2D — embeddings/LM head). Everything 1D, or in adam_ids, is routed
+    to the AdamW branch; everything else 2D goes to the Muon branch. The set
+    is computed by make_optimizer/_embedding_param_ids where the model is
+    known; the class itself never inspects modules. Internally the branches
+    become two torch param groups (lr for muon, lr_adam for adam), which the
+    shared LR schedule scales by the same multiplier.
     """
 
     def __init__(
@@ -168,30 +372,110 @@ class Muon(torch.optim.Optimizer):
         momentum: float = 0.95,       # paper uses 0.98 at scale
         eps_muon: float = 1e-5,       # enters the Newton-Schulz normalization
         ns_steps: int = 5,
+        ns_coefficients: tuple[float, float, float] = (1.5, -0.5, 0.0),
         weight_decay: float = 0.01,
         g_norm: float = 0.0,
+        adam_ids: set[int] | None = None,  # ids of 2D params that take AdamW
     ):
-        # TODO(10): the optimizer must know WHICH params take the Muon branch.
-        #           Options (pick one, justify in the report):
-        #           (a) accept param-groups-as-dicts (torch convention) with a
-        #               per-group flag, partition at the call site where the
-        #               model is known (tok_emb/lm_head/pos_emb/LayerNorms ->
-        #               adam; attention/FFN weight matrices -> muon);
-        #           (b) accept an iterable + a set of param ids to treat as
-        #               AdamW. Either way p.ndim>=2 is NOT sufficient by itself
-        #               (embeddings are 2D but belong to the AdamW branch).
-        raise NotImplementedError
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= lr_adam:
+            raise ValueError(f"Invalid lr_adam value: {lr_adam}")
+        if not 0.0 <= eps_adam:
+            raise ValueError(f"Invalid eps_adam value: {eps_adam}")
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        if not 0.0 <= momentum < 1.0:
+            raise ValueError(f"Invalid momentum value: {momentum}")
+        b1, b2 = betas
+        if not 0.0 <= b1 < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 0: {b1}")
+        if not 0.0 <= b2 < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 1: {b2}")
+        if not 0.0 <= g_norm:
+            raise ValueError(f"Invalid g_norm value: {g_norm} (0 disables the clamp)")
+        if ns_steps < 0:
+            raise ValueError(f"Invalid ns_steps value: {ns_steps}")
+        if len(ns_coefficients) != 3:
+            raise ValueError(f"ns_coefficients must be (a, b, c): {ns_coefficients}")
+
+        adam_ids = adam_ids or set()
+        muon_params, adam_params = [], []
+        for p in params:
+            if id(p) in adam_ids or p.ndim < 2:
+                adam_params.append(p)  # LayerNorm/1D, embeddings, tied LM head
+            else:
+                muon_params.append(p)  # attention/FFN weight matrices
+
+        defaults = dict(lr=lr, lr_adam=lr_adam, betas=betas, eps_adam=eps_adam,
+                        momentum=momentum, eps_muon=eps_muon, ns_steps=ns_steps,
+                        ns_coefficients=ns_coefficients,
+                        weight_decay=weight_decay, g_norm=g_norm)
+        super().__init__([
+            {"params": muon_params, "branch": "muon", "lr": lr},
+            {"params": adam_params, "branch": "adam", "lr": lr_adam},
+        ], defaults)
 
     @torch.no_grad()
     def step(self, closure=None):
-        # TODO(11): per group, per param:
-        #           muon branch: state key "momentum"; m = b*m + g_hat;
-        #                        u = b*m + g_hat;  u = ns(u, ns_steps);
-        #                        u *= sqrt(max(1, rows/cols)); p -= lr*u; p -= lr*wd*p.
-        #           adam branch: same as AdamW with lr_adam/betas/eps_adam.
-        #           Sanity invariants to hold: u orthogonal-ish (u^T u ~ I),
-        #           ||u||_F ~ 1 after NS, update norm ~ lr.
-        raise NotImplementedError
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            branch = group["branch"]
+            lr, wd = group["lr"], group["weight_decay"]
+            g_norm = group["g_norm"]
+            for p in group["params"]:
+                grad = p.grad
+                if grad is None:
+                    continue
+                state = self.state[p]
+                if len(state) == 0:
+                    state["step"] = torch.zeros((), dtype=torch.long, device=p.device)
+                    if branch == "muon":
+                        state["momentum"] = torch.zeros_like(p)  # paper State: m
+                    else:
+                        state["exp_avg"] = torch.zeros_like(p)
+                        state["exp_avg_sq"] = torch.zeros_like(p)
+                t = int(state["step"].item()) + 1
+                state["step"].fill_(t)
+
+                # Paper preamble: gradient norm clamp (both branches).
+                g_hat = _clamp_grad_norm(grad, g_norm)
+
+                if branch == "muon":
+                    beta = group["momentum"]
+                    m = state["momentum"]
+                    # Paper Alg 8: m = β*m + ĝ (no 1-β factor); Nesterov u = β*m + ĝ.
+                    m.mul_(beta).add_(g_hat)
+                    u = beta * m + g_hat  # non-mutating: m feeds the next step
+                    u = _newton_schulz(
+                        u, steps=group["ns_steps"],
+                        coefficients=group["ns_coefficients"], eps=group["eps_muon"],
+                    )
+                    # Aspect-ratio gain (Alg 8: s = sqrt(max(1, rows/cols))).
+                    rows, cols = u.shape
+                    u = u * math.sqrt(max(1.0, rows / cols))
+                    if wd != 0.0:
+                        p.mul_(1.0 - lr * wd)
+                    p.add_(u, alpha=-lr)
+                else:
+                    # "Same as AdamW Update Rule" — our Algorithm 1 body,
+                    # with this group's lr (lr_adam) and betas/eps_adam.
+                    b1, b2 = group["betas"]
+                    eps = group["eps_adam"]
+                    m, v = state["exp_avg"], state["exp_avg_sq"]
+                    if wd != 0.0:
+                        p.mul_(1.0 - lr * wd)
+                    m.lerp_(g_hat, 1.0 - b1)
+                    v.mul_(b2).addcmul_(g_hat, g_hat, value=1.0 - b2)
+                    m_hat = m / (1.0 - b1 ** t)
+                    v_hat = v / (1.0 - b2 ** t)
+                    denom = v_hat.sqrt().add_(eps)
+                    p.addcdiv_(m_hat, denom, value=-lr)
+        return loss
 
 
 # ---------------------------------------------------------------------------
@@ -206,14 +490,56 @@ PART2_OPTIMIZERS = {
 }
 
 
+def _embedding_param_ids(model) -> set[int]:
+    """Parameter ids that Algorithm 8 routes to the AdamW branch: embeddings
+    (tok_emb, pos_emb) and LayerNorm params. The tied LM head shares its
+    weight object with tok_emb, so it is covered; attention/FFN Linear
+    weights are NOT matched here and go to the Muon branch.
+    """
+    from torch import nn
+
+    ids = set()
+    for m in model.modules():
+        if isinstance(m, (nn.Embedding, nn.LayerNorm)):
+            for p in m.parameters():
+                ids.add(id(p))
+    return ids
+
+
+# Per-optimizer LR calibration starting points (part 2 defaults; the Adam
+# family inherits part 1's cfg.lr). Paper-tuned at 130M-1.2B scale in their
+# ablation tables (Appendix D/E) — calibration runs on the 0.1x budget decide.
+LION_LR = 3e-4
+MUON_LR = 8e-3
+MUON_ADAM_LR = 2.4e-3
+
+
 def make_optimizer(name: str, model, cfg) -> torch.optim.Optimizer:
     """Part 2 factory: `name` in PART2_OPTIMIZERS, hyperparams from cfg.
 
     Separate from src/train.build_optimizer (that one serves part 1 and its
     'adamw' must remain torch.optim.AdamW). Part 2 runs go through here so
     'adamw' unambiguously means OUR AdamW.
+
+    cfg is duck-typed TrainConfig (src.train): shared fairness constants
+    betas/weight_decay come from cfg; per-optimizer LRs from the constants
+    above (calibration starting points).
     """
-    # TODO(12): per-optimizer lr overrides live in TrainConfig or a small
-    #           dataclass (part 2 lr defaults; cfg.lr = part-1 baseline).
-    #           Muon: construct the role split here (model is known).
-    raise NotImplementedError
+    if name not in PART2_OPTIMIZERS:
+        raise ValueError(
+            f"unknown part 2 optimizer: {name} (choose from {sorted(PART2_OPTIMIZERS)})"
+        )
+    betas = tuple(cfg.betas)
+    wd = cfg.weight_decay
+    if name == "adamw":
+        return AdamW(model.parameters(), lr=cfg.lr, betas=betas, weight_decay=wd)
+    if name == "nadamw":
+        return NadamW(model.parameters(), lr=cfg.lr, betas=betas, weight_decay=wd)
+    if name == "lion":
+        return Lion(model.parameters(), lr=LION_LR, betas=betas, weight_decay=wd)
+    if name == "muon":
+        return Muon(
+            model.parameters(), lr=MUON_LR, lr_adam=MUON_ADAM_LR,
+            betas=betas, weight_decay=wd, adam_ids=_embedding_param_ids(model),
+        )
+    raise AssertionError(f"unreachable: {name}")
