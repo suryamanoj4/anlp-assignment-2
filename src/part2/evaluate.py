@@ -21,7 +21,8 @@ from pathlib import Path
 
 # Colab exports MPLBACKEND=module://matplotlib_inline.backend_inline, which
 # breaks `import matplotlib` inside the uv venv (same guard as part 1).
-os.environ.setdefault("MPLBACKEND", "Agg")
+# UNCONDITIONAL assignment: setdefault would keep Colab's poisoned value.
+os.environ["MPLBACKEND"] = "Agg"
 import matplotlib
 
 matplotlib.use("Agg")
