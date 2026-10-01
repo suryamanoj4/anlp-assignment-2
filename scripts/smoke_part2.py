@@ -711,6 +711,20 @@ def test_decode_and_eval(tokenizer) -> None:
     check("prompts truncated <= max_prompt; references non-empty",
           all(len(p["prompt_ids"]) <= 8 and p["reference"] for p in pairs))
 
+    # real-corpus naming (regression guard): suffixes are 'chunk_1'/'chunk_2',
+    # not 'human_chunk1' — this exact mismatch broke the first real run.
+    rows2 = []
+    for d in range(20):
+        for a in ["chunk_1", "chunk_2", "Meta-Llama-3-8B", "Meta-Llama-3-70B",
+                  "Meta-Llama-3-8B-Instruct", "Meta-Llama-3-70B-Instruct",
+                  "gpt-4o-2024-08-06", "gpt-4o-mini-2024-07-18"]:
+            rows2.append({"doc_id": f"acad_{d:04d}@{a}", "text": f"doc {d} {a} text"})
+    tr2, va2, te2 = split_rows_by_doc(rows2, seed=3)
+    pairs3 = human_pairs(te2, tokenizer, max_prompt_tokens=8, max_new=4)
+    check("real naming: chunk_1/chunk_2 suffixes resolve to pairs",
+          len(pairs3) == 1 and pairs3[0]["doc"] == te2[0]["doc_id"].split("@")[0],
+          f"{len(pairs3)} pairs")
+
     # continuation BLEU on a random tiny model: score must be a sane float
     V2 = 53
     cfgm = TransformerConfig(d_model=32, n_ctx=16, n_vocab=V2, n_layers=1,

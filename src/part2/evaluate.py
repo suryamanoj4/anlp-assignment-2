@@ -35,19 +35,33 @@ from src.part3.decode import greedy_decode
 from src.train import TrainConfig, init_wandb
 
 
+def _is_human_suffix(suffix: str) -> bool:
+    """True for the human rows of a doc.
+
+    Real corpus: the two human chunks are suffixed 'chunk_1' and 'chunk_2'
+    (verified on browndw/human-ai-parallel-corpus; doc_ids like
+    'acad_0001@chunk_1', LLM rows carry model names). The synthetic smoke
+    corpus uses 'human_chunk1'/'human_chunk2' — covered by the 'human'
+    fallback.
+    """
+    return suffix in ("chunk_1", "chunk_2") or "human" in suffix.lower()
+
+
 def human_pairs(test_rows, tokenizer, max_prompt_tokens: int, max_new: int) -> list[dict]:
     """(doc, human chunk1) -> (chunk1 prompt ids, chunk2 reference text).
 
     Grouping is by the doc root (pre-'@' prefix); within a doc the two human
-    chunks are identified by 'human' in the author suffix and ordered by
-    suffix so chunk1 (the prompt) precedes chunk2 (the reference). Docs
-    without both human chunks are skipped (counted in the log).
+    chunks are identified by _is_human_suffix and ordered by suffix so
+    chunk1 (the prompt) precedes chunk2 (the reference). Docs without both
+    human chunks are skipped (counted in the log).
     """
     by_doc: dict[str, dict[str, str]] = {}
+    hist: dict[str, int] = {}
     for r in test_rows:
         doc = r["doc_id"].split("@")[0]
         suffix = r["doc_id"].split("@")[-1]
-        if "human" in suffix.lower():
+        hist[suffix] = hist.get(suffix, 0) + 1
+        if _is_human_suffix(suffix):
             by_doc.setdefault(doc, {})[suffix] = r["text"]
     pairs = []
     skipped = 0
@@ -66,7 +80,8 @@ def human_pairs(test_rows, tokenizer, max_prompt_tokens: int, max_new: int) -> l
             "reference": tokenizer.decode(ref_ids, skip_special_tokens=True),
         })
     print(
-        f"[eval] {len(pairs)} human chunk1->chunk2 pairs from {len(by_doc)} docs "
+        f"[eval] human-pair suffixes: {sorted(h for h in hist if _is_human_suffix(h))} "
+        f"| {len(pairs)} chunk1->chunk2 pairs from {len(by_doc)} docs "
         f"({skipped} docs skipped: <2 human chunks) | "
         f"max_prompt={max_prompt_tokens} max_new={max_new}"
     )
@@ -77,6 +92,8 @@ def continuation_bleu(pairs, model, tokenizer, device, max_new: int, batch_size:
     """Greedy continuation of every prompt; corpus BLEU vs the human chunks 2."""
     import torch.nn as nn
 
+    if not pairs:
+        raise ValueError("continuation_bleu needs >= 1 human pair (run_eval_pass guards this)")
     hyps = []
     model.eval()
     for i in range(0, len(pairs), batch_size):
@@ -118,6 +135,9 @@ def eval_all_checkpoints(
     point to wandb_run when given.
     """
     ckpt_dir = Path(ckpt_dir)
+    if not pairs:
+        print("[eval] no human chunk1->chunk2 pairs available; skipping BLEU pass")
+        return []
     paths = sorted(ckpt_dir.glob(f"{run_name}_tok*.pt"),
                    key=lambda p: int(p.stem.rsplit("tok", 1)[1]))
     final = ckpt_dir / f"{run_name}_final.pt"
@@ -210,6 +230,9 @@ def run_eval_pass(
     """
     max_prompt_tokens = max(max_len - bleu_max_new, 8)
     pairs = human_pairs(test_rows, tokenizer, max_prompt_tokens, bleu_max_new)
+    if not pairs:
+        print("[main] no human pairs -> BLEU eval skipped (training/eval pipeline "
+              "continues; run after fixing the split or suffixes if this is unexpected)")
     run = init_wandb(TrainConfig(run_name=f"part2-{name}-eval"))  # None w/o key
     points = eval_all_checkpoints(
         f"part2-{name}", ckpt_dir, pairs, tokenizer, device,
