@@ -784,7 +784,8 @@ def test_main_glue(tokenizer) -> None:
     tr, va, te = split_rows_by_doc(rows, seed=7)
     with tempfile.TemporaryDirectory() as tmp:
         args = Namespace(batch_size=4, max_len=16, max_tokens=1024, seed=7,
-                         lr=8e-4, wd=0.01, device="cpu", output=f"{tmp}/out")
+                         lr=8e-4, wd=0.01, beta2=0.98, amp_dtype="fp16",
+                         device="cpu", output=f"{tmp}/out")
         gen = torch.Generator().manual_seed(7)
         run_optimizer("adamw", args, tokenizer, (tr, va, te), gen, Path(tmp) / "eval")
         ckpts = list((Path(tmp) / "out" / "checkpoints").glob("part2-adamw_*.pt"))

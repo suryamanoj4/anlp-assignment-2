@@ -39,6 +39,7 @@ class TrainConfig:
     warmup_tokens: int = 1_500_000  # ~5% of the 30M budget; schedule is a fairness constant
     lr_min_ratio: float = 0.1  # cosine floor
     amp: bool = True
+    amp_dtype: str = "fp16"  # autocast dtype when amp on: "fp16" (part 1) or "bf16" (part-2 real runs)
     ckpt_dir: str = "checkpoints"
     run_name: str = "run"
     wandb_project: str = "anlp-assignment2"  # WANDB_API_KEY comes from .env
@@ -166,6 +167,16 @@ def train_model(
     next_val = cfg.val_every_tokens
     best_ppl = float("inf")
     use_amp = cfg.amp and device.startswith("cuda")
+    amp_dtype = torch.float16
+    if use_amp:
+        if cfg.amp_dtype not in ("fp16", "bf16"):
+            raise ValueError(f"unknown amp_dtype: {cfg.amp_dtype}")
+        if cfg.amp_dtype == "bf16" and not torch.cuda.is_bf16_supported():
+            raise RuntimeError(
+                "bf16 autocast requested but this GPU does not support it "
+                "(needs Ampere+); rerun with --amp-dtype fp16"
+            )
+        amp_dtype = torch.bfloat16 if cfg.amp_dtype == "bf16" else torch.float16
 
     opt_note = (f" | optimizer={cfg.optimizer_name} lrs={cfg.optimizer_lrs}"
                 if cfg.optimizer_name else "")
@@ -182,7 +193,7 @@ def train_model(
             attn_mask = batch.attention_mask.to(device) if batch.attention_mask is not None else None
 
             if use_amp:
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                with torch.autocast(device_type="cuda", dtype=amp_dtype):
                     logits = model(ids, attn_mask)
                     loss = F.cross_entropy(
                         logits.reshape(-1, model.config.n_vocab),

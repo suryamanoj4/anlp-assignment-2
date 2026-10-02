@@ -39,7 +39,11 @@ from src.utils import load_dotenv
 DATASET_ID = "belumind/en-vi-ja-curated-500k-triplets"
 VOCAB_SIZE = 32_000
 PART2_DATASET_ID = "browndw/human-ai-parallel-corpus"
-PART2_VOCAB_SIZE = 32_000
+# English-only corpus -> English-only tokenizer: part 1's 32k vocab was
+# sized for en/vi/ja; this corpus is English-only, so 16k BPE suffices —
+# and it halves the tied embedding/head, the tensor where our 32k-vocab
+# sustained-lr churn lived.
+PART2_VOCAB_SIZE = 16_000
 
 
 def _out_paths(output: str) -> tuple[Path, Path, Path]:
@@ -220,6 +224,8 @@ def run_optimizer(
         warmup_tokens=warmup,
         lr=args.lr,  # adam family; lion/muon use their calibration constants
         weight_decay=args.wd,  # adam family + muon branches; lion uses LION_WD
+        betas=(0.9, args.beta2),  # part-2 runs pass 0.95 (standard LLM pair)
+        amp_dtype=args.amp_dtype,  # part-2 runs pass bf16 (the paper's precision, scaler-free)
         run_name=run_name,
         ckpt_dir=str(ckpt_dir),
     )
@@ -297,6 +303,13 @@ def build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--wd", type=float, default=0.01,
                     help="decoupled weight decay (adam family + muon branches; lion uses its own LION_WD); "
                          "default 0.01 = part 1; real part-2 runs pass 0.1 (the paper's tuned AdamW value)")
+    p2.add_argument("--beta2", type=float, default=0.98,
+                    help="second beta for the adam family + muon's adam branch (lion uses LION_BETAS); "
+                         "default 0.98 = part 1; real part-2 runs pass 0.95 — the standard LLM-pretraining "
+                         "pair (0.9, 0.95), faster v adaptation for our batch size")
+    p2.add_argument("--amp-dtype", choices=["fp16", "bf16"], default="fp16",
+                    help="autocast dtype (default fp16 = part 1); real part-2 runs pass bf16 — the paper's own "
+                         "precision (fp32 params + bf16 activations) and scaler-free, unlike fp16")
     p2.add_argument("--seed", type=int, default=42)
     p2.add_argument("--eval-only", action="store_true",
                     help="skip training; rerun the BLEU eval pass from saved checkpoints")

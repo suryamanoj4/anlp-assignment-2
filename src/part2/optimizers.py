@@ -21,12 +21,13 @@ reads 0): g_norm stays OFF everywhere; the global grad clip (cfg.grad_clip,
 as in their "Max Grad Norm") remains the shared stabilizer.
 
 All hyperparameter defaults below follow part 1's TrainConfig where the
-mathematics is shared (betas (0.9, 0.98), eps 1e-8); wd comes from cfg
+mathematics is shared (betas (0.9, 0.98), eps 1e-8; part-2 real runs pass
+--beta2 0.95, the standard LLM-pretraining pair); wd comes from cfg
 (part-2 real runs pass --wd 0.1, the paper's tuned AdamW value — 0.01 was
-part 1's easy-task value and churned the 2e-4 real run back to the unigram
-floor under sustained lr). The paper's own tuned values at 130M-1.2B scale
-are noted in comments as calibration starting points, NOT transcribed
-defaults.
+part 1's easy-task value and churned our 32k-vocab runs back to the
+unigram floor under sustained lr). The paper's own tuned values at
+130M-1.2B scale are noted in comments as calibration starting points,
+NOT transcribed defaults.
 """
 
 from __future__ import annotations
@@ -291,13 +292,11 @@ class Lion(torch.optim.Optimizer):
     so wd must be large enough to counteract (paper's headline: "Lion's
     optimal weight decay ~=0.6 vs. AdamW's ~=0.1"; their 130M sweep has
     beta2 0.95 best, 0.98 measurably worse). Locked for the 1x runs: lr
-    5e-5 — the paper's tuned 130M lr (1-2e-3 at their 0.52M-token batches)
-    rescaled two ways that agree: their Lion ~ AdamW/4-8 ratio (2e-4/4-8),
-    and batch scaling (their 8e-3 AdamW / ~33 batch ratio ~= 2.4e-4, which
-    independently lands on our AdamW-family lock, so Lion 1-2e-3/33).
+    1.5e-4 — the Lion paper's canonical guidance is lr ~= AdamW/3-10
+    (5e-4/3.5 ~= 1.5e-4 for our family lr).
     """
 
-    def __init__(self, params, lr: float = 5e-5,
+    def __init__(self, params, lr: float = 1.5e-4,
                  betas: tuple[float, float] = (0.9, 0.95),
                  weight_decay: float = 0.6,
                  g_norm: float = 0.0):
@@ -382,8 +381,8 @@ class Muon(torch.optim.Optimizer):
     def __init__(
         self,
         params,
-        lr: float = 6e-3,             # locked: best early 0.1x curve at 8e-3, -25% horizon trim (paper range 4-8e-3)
-        lr_adam: float = 5e-5,        # locked: half the adam family's 1e-4 (round-2 anti-drift; see constants)
+        lr: float = 0.03,             # locked: paper's tuned muon lr 1.6e-2 @130M, rising as models shrink
+        lr_adam: float = 3e-4,        # locked: ~0.5x the adam family lr (paper tunes the branches apart)
         betas: tuple[float, float] = (0.9, 0.98),   # AdamW branch betas
         eps_adam: float = 1e-8,
         momentum: float = 0.95,       # paper uses 0.98 at scale
@@ -524,35 +523,44 @@ def _embedding_param_ids(model) -> set[int]:
 
 
 # Locked per-optimizer hyperparameters for the 1x real runs. Anchors: our
-# 0.1x calibration curves (local evidence), the round-2 real-run tripwire
-# evidence, and the paper's tuned RATIOS (their absolute values are tuned
-# at 130M-1.2B params with >=0.4M token batches, ~33x our batch — and their
-# own thesis is that blind transfer is unfair). Adam family: launch with
-# --lr 1e-4 --wd 0.1.
+# own probe history + the assignment paper (Wen et al. 2025) + standard
+# practice for small-transformer pretraining.
 #
-#   Lion 0.1x run (3e-4, wd 0.01) stalled at the unigram floor and crept UP
-#   (10.3k -> 11.4k): sign updates random-walk every coordinate at +-lr, so
-#   wd must counteract (paper: optimal wd ~= 0.6; we ran 60x below it, and
-#   make_optimizer passed cfg's 0.01 over the class default). lr 5e-5 via
-#   the paper's Lion~AdamW/4-8 ratio + batch scaling (Lion docstring).
-#   Muon 0.1x run (8e-3 / 2.4e-3) exploded to 162k ppl: the ADAM branch
-#   (2.4e-3 = 3x the lr that collapsed whole-model adamw at 8e-4) on the
-#   tied 32k x 384 head. The NS branch had the BEST early curve of all four
-#   optimizers (3160 @ 411k vs adamw's 6225) -> only a 25% horizon trim.
-#   ROUND 2 (1x real run, adamw @ 2e-4 / wd 0.01): churned back to the
-#   unigram floor under SUSTAINED lr — val 1464 @ 2.9M (best of any run so
-#   far) -> 2678 -> 5148, train loss 7.29 -> 9.36, rising even as lr decayed
-#   2e-4 -> 1.57e-4. The 0.1x calibration could not see this: its compressed
-#   cosine decayed lr to 3e-5 by 4M tokens, so sustained-lr stability was
-#   never tested. Fix: adam-family lr halved (1e-4) + wd -> 0.1 (the paper's
-#   own tuned AdamW value, the anti-drift damper). Muon's adam branch gets
-#   the same protection: 5e-5 (half the family's, as before) + wd 0.1 via
-#   --wd (also the paper's tuned muon wd).
-LION_LR = 5e-5
+# Our probes (the failure history that ruled out the naive recipe):
+#   0.1x cals: adamw 8e-4/wd0.01 -> unigram collapse; 3e-4 -> dip 1689 then
+#   drift; muon 8e-3/2.4e-3 -> val 162k (the adam branch on the tied head);
+#   lion 3e-4/wd0.01 -> unigram-floor stall + creep. 1x probes: adamw
+#   2e-4/wd0.01 churned (1464 -> 5148); 1e-4/wd0.1 drifted too, only ~2x
+#   slower (wd is a mild knob: the paper's Table 36 ablation, lambda 0 vs
+#   0.1 = +0.016 loss); 8e-3/wd0.1 exploded instantly (val 333k — the
+#   paper's absolute lrs are tuned for their 0.52M-token batches, ~33x
+#   ours). Diagnosis: the churn lived in the tied 32k x 384 embedding/head
+#   under sustained peak lr, with (0.9, 0.98) and fp16-without-scaler
+#   amplifying it.
+# Stabilization (each value with an independent anchor):
+#   - English-only 16k tokenizer (halves the tied head; the corpus is
+#     English-only — part 1's 32k was sized for en/vi/ja)
+#   - betas (0.9, 0.95): the standard LLM-pretraining pair (GPT-3, LLaMA);
+#     faster v adaptation than 0.98 at our batch size
+#   - bf16 autocast: the paper's own precision (fp32 params + bf16
+#     activations) — scaler-free, unlike fp16
+#   - wd 0.1: the paper's tuned AdamW value ("AdamW's ~= 0.1")
+#   - adam-family lr 5e-4: the standard small-transformer pretraining lr
+#     (GPT-2 small 6.25e-4, nanoGPT 6e-4), conservative side; the paper's
+#     Table 36 eta curve is asymmetric (halving the tuned eta costs ~2x
+#     more than doubling), so err high within the stable band
+#   - muon lr 3e-2: the paper's own tuned muon lr is 1.6e-2 at 130M and the
+#     trend rises as models shrink; adam branch ~0.5x the family lr (the
+#     paper tunes the two branches separately)
+#   - lion lr 1.5e-4: the Lion paper's canonical guidance is lr ~= AdamW/3-10
+#     (5e-4/3.5 ~= 1.5e-4); wd 0.6 per the paper's own finding ("Lion's
+#     optimal weight decay ~= 0.6")
+# Launch: --lr 5e-4 --wd 0.1 --beta2 0.95 --amp-dtype bf16.
+LION_LR = 1.5e-4
 LION_WD = 0.6
 LION_BETAS = (0.9, 0.95)
-MUON_LR = 6e-3
-MUON_ADAM_LR = 5e-5
+MUON_LR = 0.03
+MUON_ADAM_LR = 3e-4
 
 
 def make_optimizer(name: str, model, cfg) -> torch.optim.Optimizer:
