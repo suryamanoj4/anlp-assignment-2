@@ -42,6 +42,11 @@ class TrainConfig:
     ckpt_dir: str = "checkpoints"
     run_name: str = "run"
     wandb_project: str = "anlp-assignment2"  # WANDB_API_KEY comes from .env
+    # Part 2 only (additive; part 1 never sets them): which custom optimizer
+    # is running + its ACTUAL per-group base lrs — wandb's config then shows
+    # the truth for lion/muon instead of the misleading cfg.lr.
+    optimizer_name: str | None = None
+    optimizer_lrs: dict | None = None
 
 
 def lr_lambda(step: int, warmup: int, total: int, min_ratio: float = 0.1):
@@ -162,10 +167,12 @@ def train_model(
     best_ppl = float("inf")
     use_amp = cfg.amp and device.startswith("cuda")
 
+    opt_note = (f" | optimizer={cfg.optimizer_name} lrs={cfg.optimizer_lrs}"
+                if cfg.optimizer_name else "")
     print(
         f"[train] {cfg.run_name} | device={device} | amp={use_amp} | budget={cfg.max_tokens:,} tokens "
         f"| ~{tokens_per_step} tokens/step | {total_steps} steps | lr={cfg.lr} | "
-        f"warmup ~{warmup_steps} steps, cos-decay to {cfg.lr_min_ratio}"
+        f"warmup ~{warmup_steps} steps, cos-decay to {cfg.lr_min_ratio}{opt_note}"
     )
 
     while tokens_seen < cfg.max_tokens:

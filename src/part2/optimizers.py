@@ -15,8 +15,10 @@ Paper-wide convention (Appendix A preamble): gradients enter every update as
   g_hat = g * max(1, g_norm / ||g||_2)      (per-tensor norm clamp)
 with g_norm a hyperparameter. g_norm = 0 makes it a no-op (max(1, 0) = 1),
 which is what AdamW must use to stay numerically identical to the part 1
-baseline (torch.optim.AdamW). All classes below expose g_norm for the
-remaining optimizers; the calibration runs decide whether to enable it.
+baseline (torch.optim.AdamW). All classes below expose g_norm. Decision
+(round-1 calibration + the paper's own tuned configs, whose g_norm column
+reads 0): g_norm stays OFF everywhere; the global grad clip (cfg.grad_clip,
+as in their "Max Grad Norm") remains the shared stabilizer.
 
 All hyperparameter defaults below follow part 1's TrainConfig where the
 mathematics is shared (betas (0.9, 0.98), eps 1e-8, wd 0.01); the paper's own
@@ -44,22 +46,27 @@ def _clamp_grad_norm(g: torch.Tensor, g_norm: float) -> torch.Tensor:
 def _newton_schulz(
     u: torch.Tensor,
     steps: int = 5,
-    coefficients: tuple[float, float, float] = (1.5, -0.5, 0.0),
+    coefficients: tuple[float, float, float] = (3.4445, -4.775, 2.0315),
     eps: float = 1e-5,
 ) -> torch.Tensor:
     """Newton-Schulz: orthogonalize u toward the nearest O with ||O||_op = 1.
 
-    Spec: paper Section 2's NS(M) = M(aM + bM^T M + c(M^T M)^2) family and
-    Algorithm 8 (calls it with steps=5). Normalizing first by ||u||_F + eps
+    Spec: paper Section 2's NS(M) = M(aM + bM^T M + c(M^T M)^2) family;
+    Algorithm 8 hard-codes the Moon set (3.4445, -4.775, 2.0315) with
+    steps=5 — that is the default here. Normalizing first by ||u||_F + eps
     (this is where eps_muon lives) guarantees ||u||_op <= 1, the convergence
     condition for the polynomial map on the singular values
         sigma -> sigma * (a + b*sigma^2 + c*sigma^4).
-    With (a,b,c) = (3/2, -1/2, 0) every sigma -> 1 (0 is the other fixed
-    point), i.e. the polar factor: argmax_{||O||_op<=1} Tr(O^T u).
-    The alternative (3.4445, -4.775, 2.0315) Moon set converges to a scaled
-    orthogonal frame; coefficients are exposed so calibration can choose.
-    steps=0 returns the mere normalization (used by tests to isolate the
-    surrounding Muon mechanics).
+    The Moon set drives every sigma into a small 2-cycle AROUND 1 (~0.7 to
+    ~1.1) rather than exactly onto it — cheap near-full whitening in 5
+    steps, the accepted Muon behavior (paper: "NS^(5)(M) ~
+    argmax_{||O||_op=1} Tr(O^T M)"): tiny sigmas are pushed up FAST
+    (sigma=0.1 -> ~0.34 in one step). The polar set (3/2, -1/2, 0) is the
+    exact alternative — its fixed point is exactly sigma=1 (the polar
+    factor argmax_{||O||_op<=1} Tr(O^T u)) — but it converges slowly from
+    below (sigma=0.1 only reaches ~0.66 in 5 steps), under-sharpening small
+    directions. steps=0 returns the mere normalization (used by tests to
+    isolate the surrounding Muon mechanics).
 
     Cost note (report material): the Gram matrix is formed on the MINOR
     dimension — u(u^T u) == (u u^T)u by associativity, so form u^T u
@@ -276,13 +283,20 @@ class Lion(torch.optim.Optimizer):
     sign(0)=0: those coordinates get decay only, which is intended.
     Memory: one buffer per param (vs two for Adam-class) — the category claim.
     No eps: sign() is discontinuous and needs no stability constant.
-    Scale-sensitive: lr ~1e-4..3e-4 (vs AdamW 8e-4); paper found optimal
-    wd ~0.6 at scale with their lambda convention — calibration decides.
+    Scale-sensitive: sign updates move EVERY coordinate +-lr per step (a
+    bounded random walk of std lr*sqrt(t) on noise-dominated coordinates),
+    so wd must be large enough to counteract (paper's headline: "Lion's
+    optimal weight decay ~=0.6 vs. AdamW's ~=0.1"; their 130M sweep has
+    beta2 0.95 best, 0.98 measurably worse). Locked for the 1x runs: lr
+    5e-5 — the paper's tuned 130M lr (1-2e-3 at their 0.52M-token batches)
+    rescaled two ways that agree: their Lion ~ AdamW/4-8 ratio (2e-4/4-8),
+    and batch scaling (their 8e-3 AdamW / ~33 batch ratio ~= 2.4e-4, which
+    independently lands on our AdamW-family lock, so Lion 1-2e-3/33).
     """
 
-    def __init__(self, params, lr: float = 3e-4,
-                 betas: tuple[float, float] = (0.9, 0.98),
-                 weight_decay: float = 0.1,
+    def __init__(self, params, lr: float = 5e-5,
+                 betas: tuple[float, float] = (0.9, 0.95),
+                 weight_decay: float = 0.6,
                  g_norm: float = 0.0):
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -365,14 +379,14 @@ class Muon(torch.optim.Optimizer):
     def __init__(
         self,
         params,
-        lr: float = 8e-3,             # paper's tuned eta_muon 4e-3..8e-3 at 300-520M
-        lr_adam: float = 2.4e-3,      # eta_adam for the AdamW branch
+        lr: float = 6e-3,             # locked: best early 0.1x curve at 8e-3, -25% horizon trim (paper range 4-8e-3)
+        lr_adam: float = 1e-4,        # locked: ~ paper's 0.0032 batch-scaled /33; 2.4e-3 exploded (0.1x: val 162k)
         betas: tuple[float, float] = (0.9, 0.98),   # AdamW branch betas
         eps_adam: float = 1e-8,
         momentum: float = 0.95,       # paper uses 0.98 at scale
         eps_muon: float = 1e-5,       # enters the Newton-Schulz normalization
         ns_steps: int = 5,
-        ns_coefficients: tuple[float, float, float] = (1.5, -0.5, 0.0),
+        ns_coefficients: tuple[float, float, float] = (3.4445, -4.775, 2.0315),  # paper Alg 8 (Moon set)
         weight_decay: float = 0.01,
         g_norm: float = 0.0,
         adam_ids: set[int] | None = None,  # ids of 2D params that take AdamW
@@ -506,12 +520,26 @@ def _embedding_param_ids(model) -> set[int]:
     return ids
 
 
-# Per-optimizer LR calibration starting points (part 2 defaults; the Adam
-# family inherits part 1's cfg.lr). Paper-tuned at 130M-1.2B scale in their
-# ablation tables (Appendix D/E) — calibration runs on the 0.1x budget decide.
-LION_LR = 3e-4
-MUON_LR = 8e-3
-MUON_ADAM_LR = 2.4e-3
+# Locked per-optimizer hyperparameters for the 1x real runs. Anchors: our
+# round-1 0.1x calibration curves (local evidence) + the paper's tuned
+# RATIOS (their absolute values are tuned at 130M-1.2B params with >=0.4M
+# token batches, ~33x our batch — and their own thesis is that blind
+# transfer is unfair). The Adam family inherits cfg.lr (pass --lr 2e-4).
+#
+#   Lion 0.1x run (3e-4, wd 0.01) stalled at the unigram floor and crept UP
+#   (10.3k -> 11.4k): sign updates random-walk every coordinate at +-lr, so
+#   wd must counteract (paper: optimal wd ~= 0.6; we ran 60x below it, and
+#   make_optimizer passed cfg's 0.01 over the class default). lr 5e-5 via
+#   the paper's Lion~AdamW/4-8 ratio + batch scaling (Lion docstring).
+#   Muon 0.1x run (8e-3 / 2.4e-3) exploded to 162k ppl: the ADAM branch
+#   (2.4e-3 = 3x the lr that collapsed whole-model adamw at 8e-4) on the
+#   tied 32k x 384 head. The NS branch had the BEST early curve of all four
+#   optimizers (3160 @ 411k vs adamw's 6225) -> only a 25% horizon trim.
+LION_LR = 5e-5
+LION_WD = 0.6
+LION_BETAS = (0.9, 0.95)
+MUON_LR = 6e-3
+MUON_ADAM_LR = 1e-4
 
 
 def make_optimizer(name: str, model, cfg) -> torch.optim.Optimizer:
@@ -521,9 +549,12 @@ def make_optimizer(name: str, model, cfg) -> torch.optim.Optimizer:
     'adamw' must remain torch.optim.AdamW). Part 2 runs go through here so
     'adamw' unambiguously means OUR AdamW.
 
-    cfg is duck-typed TrainConfig (src.train): shared fairness constants
-    betas/weight_decay come from cfg; per-optimizer LRs from the constants
-    above (calibration starting points).
+    cfg is duck-typed TrainConfig (src.train): the fairness constants
+    (schedule, budget, stream, seed, batch) live in cfg; betas/wd come from
+    cfg for the Adam family and Muon, while Lion overrides wd/betas with its
+    own tuned constants — per-optimizer tuning is the paper's own
+    methodology ("Lion's optimal weight decay ~=0.6 vs. AdamW's ~=0.1"),
+    not a fairness violation.
     """
     if name not in PART2_OPTIMIZERS:
         raise ValueError(
@@ -536,7 +567,8 @@ def make_optimizer(name: str, model, cfg) -> torch.optim.Optimizer:
     if name == "nadamw":
         return NadamW(model.parameters(), lr=cfg.lr, betas=betas, weight_decay=wd)
     if name == "lion":
-        return Lion(model.parameters(), lr=LION_LR, betas=betas, weight_decay=wd)
+        return Lion(model.parameters(), lr=LION_LR, betas=LION_BETAS,
+                    weight_decay=LION_WD)
     if name == "muon":
         return Muon(
             model.parameters(), lr=MUON_LR, lr_adam=MUON_ADAM_LR,

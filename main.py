@@ -172,8 +172,13 @@ def run_part2(args: argparse.Namespace) -> None:
                           args.device, args.max_len, args.bleu_max_new, args.batch_size)
         else:
             run_optimizer(name, args, tokenizer, (train_rows, val_rows, test_rows), generator, eval_dir)
-            run_eval_pass(name, tokenizer, test_rows, eval_dir, str(ckpt_dir),
-                          args.device, args.max_len, args.bleu_max_new, args.batch_size)
+            if args.skip_bleu:
+                print(f"[main] --skip-bleu: BLEU eval pass skipped for {name} — rerun later "
+                      f"with `uv run python main.py part2 --optimizer {name} --eval-only` "
+                      f"(same --output)")
+            else:
+                run_eval_pass(name, tokenizer, test_rows, eval_dir, str(ckpt_dir),
+                              args.device, args.max_len, args.bleu_max_new, args.batch_size)
 
     # Part-2-owned plots: all optimizers on shared axes (separate from part 1).
     plot_part2_curves(eval_dir)
@@ -218,6 +223,12 @@ def run_optimizer(
         ckpt_dir=str(ckpt_dir),
     )
     opt = make_p2_optimizer(name, model, train_cfg)
+    # Truth in logging: wandb's config + the banner show the ACTUAL optimizer
+    # lrs (lion/muon ignore cfg.lr — their old runs displayed a false 8e-4).
+    train_cfg.optimizer_name = name
+    train_cfg.optimizer_lrs = {
+        (g.get("branch") or "all"): g["lr"] for g in opt.param_groups
+    }
     steps, tokens = train_model(model, train_loader, val_loader, train_cfg,
                                 device=args.device, optimizer=opt)
 
@@ -235,7 +246,9 @@ def run_optimizer(
         "trained_steps": steps, "trained_tokens": tokens,
         "val_ppl_points": n_ckpts, "test_ppl": test_ppl,
         "test_bleu": None,  # TODO: continuation-BLEU eval (needs the part 3 decoder)
-        "lrs": {g["branch"] if "branch" in g else "all": g["lr"] for g in opt.param_groups},
+        # base (initial) lrs, not the end-of-run decayed values
+        "lrs": {(g.get("branch") or "all"): g.get("initial_lr", g["lr"])
+                for g in opt.param_groups},
         "seed": args.seed,
     }
     eval_dir.mkdir(parents=True, exist_ok=True)
@@ -281,6 +294,8 @@ def build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--seed", type=int, default=42)
     p2.add_argument("--eval-only", action="store_true",
                     help="skip training; rerun the BLEU eval pass from saved checkpoints")
+    p2.add_argument("--skip-bleu", action="store_true",
+                    help="train only; skip the per-checkpoint BLEU eval pass (rerun later with --eval-only)")
     p2.add_argument("--bleu-max-new", type=int, default=128,
                     help="tokens generated per test doc for continuation BLEU (reference truncated to the same budget)")
     p2.add_argument("--output", default="outputs",

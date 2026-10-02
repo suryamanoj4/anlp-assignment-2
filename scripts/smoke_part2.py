@@ -14,13 +14,16 @@ Covers, in order:
   D. Lion (custom): t=1 and t=2 hand-computed (beta roles/ordering — sign from
      b1-mix of OLD state, state advanced with b2), single-buffer memory claim,
      g_norm invisibility at t=1 but divergence later; guards
-  E. Muon + _newton_schulz (custom): NS invariants (u^T u ~ I, ~ polar factor,
-     left-Gram branch, steps=0 normalization, zero-matrix safety), role
-     partition (2D-muon / 1D+adam_ids-adam), hand-computed t=1 muon step with
-     ns_steps=0, adam-branch bit-identical to our AdamW, end-to-end tiny
-     transformer training with make_optimizer("muon", ...)
-  F. factory: all four names -> our classes (adamw is NOT torch's), per-name
-     lr constants, unknown name raises, subclass constraint
+  E. Muon + _newton_schulz (custom): NS invariants for BOTH coefficient sets
+     (Moon = paper Alg 8 default: bounded 2-cycle whitening, tiny sigma pushed
+     up fast; polar = exact orthogonalization at 20 steps, left-Gram branch,
+     steps=0 normalization, zero-matrix safety), role partition (2D-muon /
+     1D+adam_ids-adam), hand-computed t=1 muon step with ns_steps=0,
+     adam-branch bit-identical to our AdamW, end-to-end tiny transformer
+     training with make_optimizer("muon", ...)
+  F. factory: all four names -> our classes (adamw is NOT torch's), locked
+     per-name constants (lion lr/wd/betas, muon lrs), unknown name raises,
+     subclass constraint
 
 NOTE on the oracle: torch.optim.* appears in this file ONLY as a test
 reference. src/part2/* never imports any torch.optim module other than
@@ -31,12 +34,20 @@ Run:  uv run python scripts/smoke_part2.py
 
 import json
 import math
+import os
 import sys
 import tempfile
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root on path
+
+# WandB hygiene: sections G/I exercise the REAL train_model / run_optimizer /
+# run_eval_pass paths, which init wandb runs whenever a key is present — the
+# smoke would otherwise create server runs named plug-* / part2-adamw[-eval]
+# that collide with the real runs. Offline keeps them as local ./wandb dirs
+# (gitignored), so the "no network" promise in the header actually holds.
+os.environ.setdefault("WANDB_MODE", "offline")
 
 import torch
 import torch.nn.functional as F
@@ -53,7 +64,11 @@ from src.part2.data import (
 )
 from src.part2.evaluate import continuation_bleu, human_pairs, plot_part2_curves, run_eval_pass
 from src.part2.optimizers import (
+    LION_BETAS,
     LION_LR,
+    LION_WD,
+    MUON_ADAM_LR,
+    MUON_LR,
     PART2_OPTIMIZERS,
     AdamW,
     Lion,
@@ -354,30 +369,38 @@ def test_muon() -> None:
     section("E. Newton-Schulz + custom Muon (paper Appendix A, Algorithm 8)")
     torch.manual_seed(21)
 
-    # E1: Newton-Schulz helper invariants.
+    # E1: Newton-Schulz helper invariants — TWO coefficient sets.
     u0 = torch.randn(6, 4)  # wide: right-Gram branch
-    # steps=5 (paper's convention) is an APPROXIMATE polar factor: smallest
-    # singular values only reach ~0.98-0.99 -> loose bounds here.
+    # (a) paper's DEFAULT (Alg 8's Moon set): 5 steps whiten into a small
+    # 2-cycle AROUND sigma=1 (~0.7-1.1), not exactly onto it — bounded
+    # near-orthogonality, the accepted Muon behavior.
     u = _newton_schulz(u0, steps=5)
+    s5 = torch.linalg.svdvals(u)
     gram_err5 = (u.T @ u - torch.eye(4)).norm().item()
-    check("NS(5): u^T u ~ I (approx., per paper's 5-step convention)",
-          gram_err5 < 5e-2, f"||u^T u - I||_F={gram_err5:.2e}")
+    check("NS(5) Moon (paper default): singular values in the ~[0.6, 1.4] whitening band",
+          bool(((s5 > 0.6) & (s5 < 1.4)).all()), f"sv={[round(x, 3) for x in s5.tolist()]}")
+    check("NS(5) Moon: near-orthogonal (bounded, NOT exact)",
+          gram_err5 < 1.0, f"||u^T u - I||_F={gram_err5:.2e}")
+    d_test = torch.diag(torch.tensor([0.1, 1.0]))
+    s_moon = torch.linalg.svdvals(_newton_schulz(d_test, steps=1)).min().item()
+    s_polar = torch.linalg.svdvals(
+        _newton_schulz(d_test, steps=1, coefficients=(1.5, -0.5, 0.0))).min().item()
+    check("Moon pushes tiny sigma up fast in 1 step (polar does not)",
+          s_moon > 0.2 and s_polar < 0.16, f"moon {s_moon:.3f} vs polar {s_polar:.3f}")
+    # (b) the polar set: EXACT orthogonalization — the convergence proof.
     p = torch.linalg.svd(u0, full_matrices=False)
     polar = p.U @ p.Vh
-    d5 = (u - polar).norm().item() / polar.norm().item()
-    check("NS(5): u close to exact polar factor", d5 < 1e-2, f"rel diff {d5:.2e}")
-    # With more steps the iteration converges quadratically (singular values
-    # -> 1, i.e. exact polar): tight bounds prove the contraction claim.
-    u20 = _newton_schulz(u0, steps=20)
-    gram_err20 = (u20.T @ u20 - torch.eye(4)).norm().item()
-    d20 = (u20 - polar).norm().item() / polar.norm().item()
-    check("NS(20): converges to exact polar (quadratic contraction)",
+    up = _newton_schulz(u0, steps=20, coefficients=(1.5, -0.5, 0.0))
+    gram_err20 = (up.T @ up - torch.eye(4)).norm().item()
+    d20 = (up - polar).norm().item() / polar.norm().item()
+    check("NS(20) polar coefficients: exact polar (quadratic contraction)",
           gram_err20 < 1e-4 and d20 < 1e-4, f"||u^T u - I||={gram_err20:.2e} rel {d20:.2e}")
     u1 = torch.randn(3, 7)  # tall: left-Gram branch
-    u1ns = _newton_schulz(u1, steps=8)
+    u1ns = _newton_schulz(u1, steps=8, coefficients=(1.5, -0.5, 0.0))
     p1 = torch.linalg.svd(u1, full_matrices=False)
     d1 = (u1ns - p1.U @ p1.Vh).norm().item() / (p1.U @ p1.Vh).norm().item()
-    check("NS(8) tall matrix ~ polar (left-Gram branch)", d1 < 2e-3, f"rel diff {d1:.2e}")
+    check("NS(8) polar, tall matrix ~ exact polar (left-Gram branch)",
+          d1 < 2e-3, f"rel diff {d1:.2e}")
     z = torch.zeros(4, 3)
     check("NS on zero matrix is safe (no nan)",
           bool(torch.isfinite(_newton_schulz(z)).all()))
@@ -456,8 +479,10 @@ def test_muon() -> None:
     n_adam = len(optmuon.param_groups[1]["params"])
     check("factory split: 8 matrices muon / 12 adam (2 emb + 10 layernorm w/b)",
           n_muon == 8 and n_adam == 12, f"muon={n_muon} adam={n_adam}")
-    check("muon group lrs from calibration constants",
-          optmuon.param_groups[0]["lr"] == 8e-3 and optmuon.param_groups[1]["lr"] == 2.4e-3)
+    check("muon group lrs from locked constants",
+          optmuon.param_groups[0]["lr"] == MUON_LR
+          and optmuon.param_groups[1]["lr"] == MUON_ADAM_LR,
+          f"lr={MUON_LR} lr_adam={MUON_ADAM_LR}")
     x = torch.randint(0, V, (2, 8))
     y = torch.randint(0, V, (2, 8))
     losses = []
@@ -508,8 +533,12 @@ def test_factory() -> None:
     check("adam family lr == cfg.lr (part 1 baseline)",
           make_optimizer("adamw", model, tcfg).param_groups[0]["lr"] == tcfg.lr
           and make_optimizer("nadamw", model, tcfg).param_groups[0]["lr"] == tcfg.lr)
-    check("lion lr == LION_LR calibration constant",
-          make_optimizer("lion", model, tcfg).param_groups[0]["lr"] == LION_LR)
+    lion_opt = make_optimizer("lion", model, tcfg)
+    check("lion lr/wd/betas == locked constants (NOT cfg's)",
+          lion_opt.param_groups[0]["lr"] == LION_LR
+          and lion_opt.param_groups[0]["weight_decay"] == LION_WD
+          and tuple(lion_opt.param_groups[0]["betas"]) == tuple(LION_BETAS),
+          f"lr={LION_LR} wd={LION_WD} betas={tuple(LION_BETAS)}")
     try:
         make_optimizer("sofia", model, tcfg)
     except ValueError:
@@ -764,10 +793,11 @@ def test_main_glue(tokenizer) -> None:
         mpath = Path(tmp) / "eval" / "part2-adamw_metrics.json"
         assert mpath.exists()
         m = json.loads(mpath.read_text())
-        check("run_optimizer: metrics json (budget, test ppl, lrs)",
+        check("run_optimizer: metrics json (budget, test ppl, base lrs)",
               m["optimizer"] == "adamw" and m["budget_tokens"] == 1024
-              and m["test_ppl"] > 0 and m["test_bleu"] is None,
-              f"test_ppl={m['test_ppl']:.2f}")
+              and m["test_ppl"] > 0 and m["test_bleu"] is None
+              and m["lrs"] == {"all": 8e-4},
+              f"test_ppl={m['test_ppl']:.2f} lrs={m['lrs']}")
 
         # the new eval pass: per-ckpt continuation BLEU -> json -> plots
         run_eval_pass("adamw", tokenizer, te, Path(tmp) / "eval",
