@@ -219,6 +219,7 @@ def run_optimizer(
         val_every_tokens=val_every,
         warmup_tokens=warmup,
         lr=args.lr,  # adam family; lion/muon use their calibration constants
+        weight_decay=args.wd,  # adam family + muon branches; lion uses LION_WD
         run_name=run_name,
         ckpt_dir=str(ckpt_dir),
     )
@@ -249,6 +250,8 @@ def run_optimizer(
         # base (initial) lrs, not the end-of-run decayed values
         "lrs": {(g.get("branch") or "all"): g.get("initial_lr", g["lr"])
                 for g in opt.param_groups},
+        "weight_decay": {(g.get("branch") or "all"): g["weight_decay"]
+                         for g in opt.param_groups},
         "seed": args.seed,
     }
     eval_dir.mkdir(parents=True, exist_ok=True)
@@ -291,6 +294,9 @@ def build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--max-len", type=int, default=512)
     p2.add_argument("--lr", type=float, default=8e-4,
                     help="adam-family lr (lion/muon use their calibration constants in src/part2/optimizers.py)")
+    p2.add_argument("--wd", type=float, default=0.01,
+                    help="decoupled weight decay (adam family + muon branches; lion uses its own LION_WD); "
+                         "default 0.01 = part 1; real part-2 runs pass 0.1 (the paper's tuned AdamW value)")
     p2.add_argument("--seed", type=int, default=42)
     p2.add_argument("--eval-only", action="store_true",
                     help="skip training; rerun the BLEU eval pass from saved checkpoints")

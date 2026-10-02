@@ -784,7 +784,7 @@ def test_main_glue(tokenizer) -> None:
     tr, va, te = split_rows_by_doc(rows, seed=7)
     with tempfile.TemporaryDirectory() as tmp:
         args = Namespace(batch_size=4, max_len=16, max_tokens=1024, seed=7,
-                         lr=8e-4, device="cpu", output=f"{tmp}/out")
+                         lr=8e-4, wd=0.01, device="cpu", output=f"{tmp}/out")
         gen = torch.Generator().manual_seed(7)
         run_optimizer("adamw", args, tokenizer, (tr, va, te), gen, Path(tmp) / "eval")
         ckpts = list((Path(tmp) / "out" / "checkpoints").glob("part2-adamw_*.pt"))
@@ -793,11 +793,11 @@ def test_main_glue(tokenizer) -> None:
         mpath = Path(tmp) / "eval" / "part2-adamw_metrics.json"
         assert mpath.exists()
         m = json.loads(mpath.read_text())
-        check("run_optimizer: metrics json (budget, test ppl, base lrs)",
+        check("run_optimizer: metrics json (budget, test ppl, base lrs, wd)",
               m["optimizer"] == "adamw" and m["budget_tokens"] == 1024
               and m["test_ppl"] > 0 and m["test_bleu"] is None
-              and m["lrs"] == {"all": 8e-4},
-              f"test_ppl={m['test_ppl']:.2f} lrs={m['lrs']}")
+              and m["lrs"] == {"all": 8e-4} and m["weight_decay"] == {"all": 0.01},
+              f"test_ppl={m['test_ppl']:.2f} lrs={m['lrs']} wd={m['weight_decay']}")
 
         # the new eval pass: per-ckpt continuation BLEU -> json -> plots
         run_eval_pass("adamw", tokenizer, te, Path(tmp) / "eval",

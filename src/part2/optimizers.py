@@ -21,9 +21,12 @@ reads 0): g_norm stays OFF everywhere; the global grad clip (cfg.grad_clip,
 as in their "Max Grad Norm") remains the shared stabilizer.
 
 All hyperparameter defaults below follow part 1's TrainConfig where the
-mathematics is shared (betas (0.9, 0.98), eps 1e-8, wd 0.01); the paper's own
-tuned values at 130M-1.2B scale are noted in comments as calibration
-starting points, NOT transcribed defaults.
+mathematics is shared (betas (0.9, 0.98), eps 1e-8); wd comes from cfg
+(part-2 real runs pass --wd 0.1, the paper's tuned AdamW value — 0.01 was
+part 1's easy-task value and churned the 2e-4 real run back to the unigram
+floor under sustained lr). The paper's own tuned values at 130M-1.2B scale
+are noted in comments as calibration starting points, NOT transcribed
+defaults.
 """
 
 from __future__ import annotations
@@ -380,7 +383,7 @@ class Muon(torch.optim.Optimizer):
         self,
         params,
         lr: float = 6e-3,             # locked: best early 0.1x curve at 8e-3, -25% horizon trim (paper range 4-8e-3)
-        lr_adam: float = 1e-4,        # locked: ~ paper's 0.0032 batch-scaled /33; 2.4e-3 exploded (0.1x: val 162k)
+        lr_adam: float = 5e-5,        # locked: half the adam family's 1e-4 (round-2 anti-drift; see constants)
         betas: tuple[float, float] = (0.9, 0.98),   # AdamW branch betas
         eps_adam: float = 1e-8,
         momentum: float = 0.95,       # paper uses 0.98 at scale
@@ -521,10 +524,11 @@ def _embedding_param_ids(model) -> set[int]:
 
 
 # Locked per-optimizer hyperparameters for the 1x real runs. Anchors: our
-# round-1 0.1x calibration curves (local evidence) + the paper's tuned
-# RATIOS (their absolute values are tuned at 130M-1.2B params with >=0.4M
-# token batches, ~33x our batch — and their own thesis is that blind
-# transfer is unfair). The Adam family inherits cfg.lr (pass --lr 2e-4).
+# 0.1x calibration curves (local evidence), the round-2 real-run tripwire
+# evidence, and the paper's tuned RATIOS (their absolute values are tuned
+# at 130M-1.2B params with >=0.4M token batches, ~33x our batch — and their
+# own thesis is that blind transfer is unfair). Adam family: launch with
+# --lr 1e-4 --wd 0.1.
 #
 #   Lion 0.1x run (3e-4, wd 0.01) stalled at the unigram floor and crept UP
 #   (10.3k -> 11.4k): sign updates random-walk every coordinate at +-lr, so
@@ -535,11 +539,20 @@ def _embedding_param_ids(model) -> set[int]:
 #   (2.4e-3 = 3x the lr that collapsed whole-model adamw at 8e-4) on the
 #   tied 32k x 384 head. The NS branch had the BEST early curve of all four
 #   optimizers (3160 @ 411k vs adamw's 6225) -> only a 25% horizon trim.
+#   ROUND 2 (1x real run, adamw @ 2e-4 / wd 0.01): churned back to the
+#   unigram floor under SUSTAINED lr — val 1464 @ 2.9M (best of any run so
+#   far) -> 2678 -> 5148, train loss 7.29 -> 9.36, rising even as lr decayed
+#   2e-4 -> 1.57e-4. The 0.1x calibration could not see this: its compressed
+#   cosine decayed lr to 3e-5 by 4M tokens, so sustained-lr stability was
+#   never tested. Fix: adam-family lr halved (1e-4) + wd -> 0.1 (the paper's
+#   own tuned AdamW value, the anti-drift damper). Muon's adam branch gets
+#   the same protection: 5e-5 (half the family's, as before) + wd 0.1 via
+#   --wd (also the paper's tuned muon wd).
 LION_LR = 5e-5
 LION_WD = 0.6
 LION_BETAS = (0.9, 0.95)
 MUON_LR = 6e-3
-MUON_ADAM_LR = 1e-4
+MUON_ADAM_LR = 5e-5
 
 
 def make_optimizer(name: str, model, cfg) -> torch.optim.Optimizer:
@@ -554,7 +567,8 @@ def make_optimizer(name: str, model, cfg) -> torch.optim.Optimizer:
     cfg for the Adam family and Muon, while Lion overrides wd/betas with its
     own tuned constants — per-optimizer tuning is the paper's own
     methodology ("Lion's optimal weight decay ~=0.6 vs. AdamW's ~=0.1"),
-    not a fairness violation.
+    not a fairness violation. cfg.weight_decay is set per launch (--wd):
+    real part-2 runs pass 0.1; the 0.01 default is part 1's easy-task value.
     """
     if name not in PART2_OPTIMIZERS:
         raise ValueError(
