@@ -8,6 +8,14 @@ Attention uses F.scaled_dot_product_attention (explicitly permitted by the
 assignment). Positional embeddings are learned. forward() accepts an optional
 attention_mask (B, T) with 1 = real token, 0 = pad, combined with the causal
 mask inside the attention layer; without one, attention is purely causal.
+
+KV-cache seam (decode-only, additive): forward(x, attn_mask=None, past_kv=None)
+— past_kv=None runs the exact part-1 path; past_kv=[per-layer states] runs the
+cached protocol (used by src/part3/decode.py): x holds only NEW token
+positions, positions in the cache are prepended to K/V, and the per-step
+attention is masked to the cached prefix. The cache changes execution only:
+per-position K/V are computed once and reused, so the computed logits (and the
+decoded token sequence) are identical to the recompute path.
 """
 
 from __future__ import annotations
@@ -132,25 +140,51 @@ class CausalSelfAttention(nn.Module):
         self.proj = nn.Linear(config.d_model, config.d_model, bias=False)
         self.drop = nn.Dropout(config.dropout)
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        past_kv: Optional[tuple] = None,
+    ) -> torch.Tensor:
         # attn_mask: (B, T), 1 = real token, 0 = pad; combined with the causal mask.
         B, T, C = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        if attn_mask is None:
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        else:
-            # One bool mask over (B, 1, T, T): False = do not attend.
-            causal = torch.triu(
-                torch.ones(T, T, dtype=torch.bool, device=x.device), diagonal=1
-            )
-            padded = (attn_mask == 0).unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
-            mask = ~(causal | padded)  # broadcasts to (B, 1, T, T); True = attend
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        if past_kv is None:
+            # Part-1 path, unchanged: full-sequence forward, no cache.
+            if attn_mask is None:
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            else:
+                # One bool mask over (B, 1, T, T): False = do not attend.
+                causal = torch.triu(
+                    torch.ones(T, T, dtype=torch.bool, device=x.device), diagonal=1
+                )
+                padded = (attn_mask == 0).unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
+                mask = ~(causal | padded)  # broadcasts to (B, 1, T, T); True = attend
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+            y = y.transpose(1, 2).contiguous().view(B, T, C)
+            return self.drop(self.proj(y))
+        # KV-cache path: k/v are the NEW positions; prepend the cached ones and
+        # mask the new queries over the full key prefix.
+        k_past, v_past, key_valid = past_kv  # (B,H,Tp,Dh), (B,Tp) bool
+        T_past = k_past.shape[2]
+        k = torch.cat([k_past, k], dim=2)
+        v = torch.cat([v_past, v], dim=2)
+        new_valid = (
+            (attn_mask != 0)
+            if attn_mask is not None
+            else torch.ones(B, T, dtype=torch.bool, device=x.device)
+        )
+        key_valid = torch.cat([key_valid, new_valid], dim=1)
+        row = torch.arange(T, device=x.device)[:, None]             # (T, 1)
+        col = torch.arange(T_past + T, device=x.device)[None, :]     # (1, T_tot)
+        causal = col <= (T_past + row)                                # (T, T_tot)
+        mask = causal[None, None, :, :] & key_valid[:, None, None, :]  # (B,1,T,T_tot)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.drop(self.proj(y))
+        return self.drop(self.proj(y)), (k, v, key_valid)
 
 
 class Block(nn.Module):
@@ -161,10 +195,20 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(config.d_model)
         self.ffn = MoE(config) if config.ffn_variant > 1 else MLP(config)
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x), attn_mask)
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        past_kv: Optional[tuple] = None,
+    ) -> torch.Tensor:
+        if past_kv is None:
+            x = x + self.attn(self.ln1(x), attn_mask)
+            x = x + self.ffn(self.ln2(x))
+            return x
+        y, attn_state = self.attn(self.ln1(x), attn_mask, past_kv)
+        x = x + y
         x = x + self.ffn(self.ln2(x))
-        return x
+        return x, attn_state
 
 
 class Transformer(nn.Module):
@@ -188,17 +232,45 @@ class Transformer(nn.Module):
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, std=0.02)
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # Input: (B, T) token ids. Output: (B, T, n_vocab) logits.
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        past_kv: Optional[list] = None,
+    ) -> torch.Tensor:
+        """past_kv=None: the part-1 path, unchanged (returns logits only).
+
+        past_kv=list: KV-cache protocol for decoding — x holds only NEW token
+        positions; returns (logits, next_past). past_kv=[] starts the protocol
+        on a full (prompt-length) call with an empty cache.
+        """
         B, T = x.shape
         assert T <= self.config.n_ctx
         if attn_mask is not None:
             assert attn_mask.shape == x.shape
-        pos = torch.arange(T, device=x.device)
+        if past_kv is None:
+            pos = torch.arange(T, device=x.device)
+            h = self.tok_emb(x) + self.pos_emb(pos)
+            for block in self.blocks:
+                h = block(h, attn_mask)
+            return self.lm_head(self.ln_f(h))
+        if len(past_kv) == 0:
+            head_dim = self.config.d_model // self.config.n_heads
+            empty_state = (
+                x.new_zeros(B, self.config.n_heads, 0, head_dim),
+                x.new_zeros(B, self.config.n_heads, 0, head_dim),
+                x.new_zeros(B, 0, dtype=torch.bool),
+            )
+            past_kv = [empty_state for _ in self.blocks]
+        pos_offset = past_kv[0][0].shape[2]
+        assert pos_offset + T <= self.config.n_ctx
+        pos = torch.arange(pos_offset, pos_offset + T, device=x.device)
         h = self.tok_emb(x) + self.pos_emb(pos)
-        for block in self.blocks:
-            h = block(h, attn_mask)
-        return self.lm_head(self.ln_f(h))
+        next_past = []
+        for block, kv in zip(self.blocks, past_kv):
+            h, attn_state = block(h, attn_mask, kv)
+            next_past.append(attn_state)
+        return self.lm_head(self.ln_f(h)), next_past
 
     def record_usage(self, language: str) -> None:
         """Ask every MoE block to accumulate routing counts for `language`."""

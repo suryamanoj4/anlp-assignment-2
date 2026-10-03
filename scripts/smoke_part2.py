@@ -764,6 +764,19 @@ def test_decode_and_eval(tokenizer) -> None:
     check("continuation_bleu returns a score in [0, 100]", 0.0 <= bleu <= 100.0,
           f"bleu={bleu:.2f}")
 
+    # KV-cache equivalence on a REAL transformer: the cached decode must give
+    # EXACTLY the same tokens as the full-sequence recompute path (the seam
+    # only changes execution; the eval's BLEU numbers must not move).
+    torch.manual_seed(5)
+    eq_prompts = torch.randint(1, V2, (3, 6))  # no pads; eos(0) absent a priori
+    eq_cached = greedy_decode(model, eq_prompts, max_new=5, eos_id=0, pad_id=0)
+    ids = eq_prompts.clone()
+    for _ in range(5):
+        ids = torch.cat([ids, model(ids, (ids != 0).long())[:, -1, :].argmax(-1)[:, None]], dim=1)
+    check("kv-cache decode == full-sequence rollout (exact token equality)",
+          torch.equal(eq_cached, ids[:, 6:]),
+          f"cached={eq_cached.tolist()} rollout={ids[:, 6:].tolist()}")
+
 
 # ---------------------------------------------------------------- I. glue
 def test_main_glue(tokenizer) -> None:
