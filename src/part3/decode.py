@@ -8,7 +8,7 @@ citizens on the shared forward path:
                     it);
   top_k_decode   — sample from the top-k filtered+renormalized distribution;
   top_p_decode   — sample from the smallest probability prefix reaching p;
-  beam_decode    — (planned) beam search at widths 1/2/4.
+  beam_decode    — beam search at widths 1/2/4 (per-row hypothesis sets).
 
 Relationship to part 1: src/part1/evaluate.greedy_translate is the earlier
 single-sequence, translation-flavored twin (bos + src + eos prompts, BLEU
@@ -37,6 +37,8 @@ Part 3's beam-width-vs-time analysis will extend the cache explicitly.
 """
 
 from __future__ import annotations
+
+import inspect
 
 import torch
 
@@ -82,13 +84,35 @@ def greedy_decode(
     ids = prompt_ids.clone()
     done = torch.zeros(ids.shape[0], dtype=torch.bool, device=device)
 
-    # Use the KV-cache protocol iff the model's forward accepts past_kv.
+    # KV-cache protocol: engage iff the model's forward advertises past_kv.
+    # Signature probe (not try/except around the call): a real error inside
+    # the cache path must propagate loudly, never silently fall back.
     encode = None
+    cached = False
     try:
-        encode = model(ids, (ids != pad_id).long(), past_kv=[])  # (logits, past)
-        cached = True
-    except TypeError:
+        if "past_kv" in inspect.signature(model.forward).parameters:
+            # Preallocate the KV buffers ONCE for this decode: fixed sizes,
+            # in-place fills, no per-step allocation growth (the naive cat
+            # version churned the allocator: ~6.8 min/checkpoint on GPU).
+            B = ids.shape[0]
+            max_T = prompt_ids.shape[1] + max_new
+            head_dim = model.config.d_model // model.config.n_heads
+            param = next(model.parameters())
+            buffers = [
+                (param.new_zeros(B, model.config.n_heads, max_T, head_dim),
+                 param.new_zeros(B, model.config.n_heads, max_T, head_dim),
+                 ids.new_zeros(B, max_T, dtype=torch.bool),
+                 0)
+                for _ in range(model.config.n_layers)
+            ]
+            encode = model(ids, (ids != pad_id).long(), past_kv=buffers)  # (logits, past)
+            cached = True
+    except (TypeError, ValueError):
         cached = False
+    if cached:
+        print(f"[decode] kv-cache path: prompt encode + {max_new} cached single-token steps")
+    else:
+        print("[decode] recompute path (model.forward has no past_kv) — O(T^2), slower")
 
     nxt = None
     steps = 0
@@ -141,6 +165,8 @@ def top_k_decode(
     reproducible runs (the eval harness seeds once per strategy instead).
     """
     _check_context(model, prompt_ids.shape[1], max_new)
+    if temperature <= 0:
+        raise ValueError(f"temperature must be > 0, got {temperature}")
     if seed is not None:
         torch.manual_seed(seed)
     ids = prompt_ids.clone()
@@ -150,7 +176,10 @@ def top_k_decode(
             break
         masks = (ids != pad_id).long()
         logits = model(ids, masks)[:, -1, :] / temperature  # (B, V)
-        topk_vals, topk_idx = torch.topk(logits, k=k, dim=-1)  # (B, k) each
+        k_eff = min(int(k), logits.shape[-1])  # torch.topk requires k <= V
+        if k_eff < 1:
+            raise ValueError(f"k must be >= 1, got {k}")
+        topk_vals, topk_idx = torch.topk(logits, k=k_eff, dim=-1)  # (B, k) each
         filtered = torch.full_like(logits, float("-inf"))
         filtered.scatter_(-1, topk_idx, topk_vals)  # non-top-k -> -inf
         probs = torch.softmax(filtered, dim=-1)      # renormalize top-k only
@@ -188,6 +217,10 @@ def top_p_decode(
     adaptive, shape-dependent k.
     """
     _check_context(model, prompt_ids.shape[1], max_new)
+    if not 0 < p <= 1:
+        raise ValueError(f"p must be in (0, 1], got {p}")
+    if temperature <= 0:
+        raise ValueError(f"temperature must be > 0, got {temperature}")
     if seed is not None:
         torch.manual_seed(seed)
     ids = prompt_ids.clone()

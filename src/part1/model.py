@@ -166,25 +166,29 @@ class CausalSelfAttention(nn.Module):
                 y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
             y = y.transpose(1, 2).contiguous().view(B, T, C)
             return self.drop(self.proj(y))
-        # KV-cache path: k/v are the NEW positions; prepend the cached ones and
-        # mask the new queries over the full key prefix.
-        k_past, v_past, key_valid = past_kv  # (B,H,Tp,Dh), (B,Tp) bool
-        T_past = k_past.shape[2]
-        k = torch.cat([k_past, k], dim=2)
-        v = torch.cat([v_past, v], dim=2)
+        # Buffered KV-cache path: past_kv = (k_buf, v_buf, key_valid, T_past).
+        # Buffers are preallocated once per decode call; new K/V are written
+        # IN-PLACE into slices and attention runs over narrowed views — no
+        # per-step tensor growth/allocation churn.
+        k_buf, v_buf, key_valid, T_past = past_kv
         new_valid = (
             (attn_mask != 0)
             if attn_mask is not None
             else torch.ones(B, T, dtype=torch.bool, device=x.device)
         )
-        key_valid = torch.cat([key_valid, new_valid], dim=1)
-        row = torch.arange(T, device=x.device)[:, None]             # (T, 1)
-        col = torch.arange(T_past + T, device=x.device)[None, :]     # (1, T_tot)
-        causal = col <= (T_past + row)                                # (T, T_tot)
-        mask = causal[None, None, :, :] & key_valid[:, None, None, :]  # (B,1,T,T_tot)
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        k_buf[:, :, T_past:T_past + T] = k
+        v_buf[:, :, T_past:T_past + T] = v
+        key_valid[:, T_past:T_past + T] = new_valid
+        T_tot = T_past + T
+        k_full = k_buf[:, :, :T_tot]  # narrowed views: no copies
+        v_full = v_buf[:, :, :T_tot]
+        row = torch.arange(T, device=x.device)[:, None]
+        col = torch.arange(T_tot, device=x.device)[None, :]
+        causal = col <= (T_past + row)
+        mask = causal[None, None, :, :] & key_valid[:, None, None, :T_tot]
+        y = F.scaled_dot_product_attention(q, k_full, v_full, attn_mask=mask)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.drop(self.proj(y)), (k, v, key_valid)
+        return self.drop(self.proj(y)), (k_buf, v_buf, key_valid, T_tot)
 
 
 class Block(nn.Module):
@@ -255,14 +259,16 @@ class Transformer(nn.Module):
                 h = block(h, attn_mask)
             return self.lm_head(self.ln_f(h))
         if len(past_kv) == 0:
+            # Defensive fallback for direct callers: allocate the cache
+            # buffers at the context size (greedy_decode preallocates the
+            # exact budget instead).
             head_dim = self.config.d_model // self.config.n_heads
-            empty_state = (
-                x.new_zeros(B, self.config.n_heads, 0, head_dim),
-                x.new_zeros(B, self.config.n_heads, 0, head_dim),
-                x.new_zeros(B, 0, dtype=torch.bool),
-            )
-            past_kv = [empty_state for _ in self.blocks]
-        pos_offset = past_kv[0][0].shape[2]
+            param = next(self.parameters())
+            k_buf = param.new_zeros(B, self.config.n_heads, self.config.n_ctx, head_dim)
+            v_buf = param.new_zeros(B, self.config.n_heads, self.config.n_ctx, head_dim)
+            valid = x.new_zeros(B, self.config.n_ctx, dtype=torch.bool)
+            past_kv = [(k_buf, v_buf, valid, 0) for _ in self.blocks]
+        pos_offset = past_kv[0][3]  # current fill length
         assert pos_offset + T <= self.config.n_ctx
         pos = torch.arange(pos_offset, pos_offset + T, device=x.device)
         h = self.tok_emb(x) + self.pos_emb(pos)
